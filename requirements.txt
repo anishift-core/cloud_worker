@@ -1,0 +1,5 @@
+requests
+firebase-admin
+deep-translator
+python-dotenv
+chardet
