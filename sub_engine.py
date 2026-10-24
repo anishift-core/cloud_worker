@@ -234,9 +234,17 @@ def ensure_github_repository(github_repo, github_token):
         if c_resp.status_code in (200, 201):
             print(f"✅ Automatically created repository: {github_repo}", flush=True)
             time.sleep(2) # Give GitHub a moment to provision
-            return github_repo
-        else:
-            print(f"⚠️ Could not auto-create repo: {c_resp.status_code} {c_resp.text}", flush=True)
+    # Ensure repo is not empty (GitHub rejects Releases on repos with 0 commits / no default branch)
+    commit_check = requests.get(f"https://api.github.com/repos/{github_repo}/commits", headers=headers, timeout=10)
+    if commit_check.status_code == 409 or (commit_check.status_code == 404 and resp.status_code == 200):
+        print(f"🌱 Initializing empty repository '{github_repo}' with initial commit...", flush=True)
+        readme_payload = {
+            "message": "Initial commit - AniShift Sub Vault",
+            "content": "IyBBbmlTaGlmdCBTdWJ0aXRsZSBWYXVsdA==", # Base64 of "# AniShift Subtitle Vault"
+            "branch": "main"
+        }
+        requests.put(f"https://api.github.com/repos/{github_repo}/contents/README.md", headers=headers, json=readme_payload, timeout=15)
+        time.sleep(2)
 
     return github_repo
 
