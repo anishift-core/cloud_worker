@@ -173,6 +173,10 @@ def process_and_translate_vtt(vtt_content, max_threads=20):
         translated = translate_guaranteed_sinhala(orig_text)
         return orig_text, translated
 
+    completed_count = 0
+    total_unique = len(unique_texts)
+    print(f"📊 Total unique subtitle lines to translate: {total_unique} (using {max_threads} parallel threads)", flush=True)
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_threads) as executor:
         future_to_text = {executor.submit(worker_translate, t): t for t in unique_texts}
         for future in concurrent.futures.as_completed(future_to_text):
@@ -182,6 +186,10 @@ def process_and_translate_vtt(vtt_content, max_threads=20):
             except Exception:
                 t = future_to_text[future]
                 translation_cache[t] = t
+            completed_count += 1
+            if completed_count % 50 == 0 or completed_count == total_unique:
+                pct = int((completed_count / total_unique) * 100)
+                print(f"   ⏳ Translated {completed_count}/{total_unique} lines ({pct}%)...", flush=True)
 
     # Reassemble WebVTT with verified Sinhala text
     out_lines = ["WEBVTT", "Kind: captions", "Language: si", ""]
@@ -299,6 +307,25 @@ def upload_sub_to_github_release(vtt_text, anime_id, ep_num, github_token, githu
             "draft": False,
             "prerelease": False
         }, timeout=15)
+
+        # Self-healing: If repo is empty, seed a README commit and retry
+        if c_resp.status_code == 422 and "Repository is empty" in c_resp.text:
+            print(f"🌱 Repository '{github_repo}' has no commits. Auto-committing README.md...", flush=True)
+            readme_payload = {
+                "message": "Initial commit - AniShift Sub Vault",
+                "content": "IyBBbmlTaGlmdCBTdWJ0aXRsZSBWYXVsdA==", # Base64 for "# AniShift Subtitle Vault"
+                "branch": "main"
+            }
+            requests.put(f"https://api.github.com/repos/{github_repo}/contents/README.md", headers=headers, json=readme_payload, timeout=15)
+            time.sleep(2)
+            c_resp = requests.post(create_url, headers=headers, json={
+                "tag_name": tag_name,
+                "name": release_display_name,
+                "body": f"Automated WebVTT Sinhala subtitles for {anime_title or anime_id} (Batch {chunk_idx})",
+                "draft": False,
+                "prerelease": False
+            }, timeout=15)
+
         if c_resp.status_code in (200, 201):
             rel_data = c_resp.json()
             release_id = rel_data["id"]
