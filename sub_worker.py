@@ -49,9 +49,9 @@ def init_firebase():
 
     if not firebase_admin._apps:
         cred = credentials.Certificate(key_path)
-        firebase_admin.initialize_app(cred, {"databaseURL": FIREBASE_DB_URL}, name="primary_app")
+        firebase_admin.initialize_app(cred, {"databaseURL": FIREBASE_DB_URL})
     
-    primary_client = firestore.client(app=firebase_admin.get_app("primary_app"))
+    primary_client = firestore.client()
 
     # 2. Backup DB (anisora-core) if available
     backup_key_path = "anisora-core.json"
