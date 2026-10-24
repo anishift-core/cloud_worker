@@ -343,15 +343,30 @@ def upload_sub_to_github_release(vtt_text, anime_id, ep_num, github_token, githu
 
     base_upload_url = upload_url_template.split("{")[0]
 
-    # Delete existing asset if present to allow clean replacement
-    assets_url = f"https://api.github.com/repos/{github_repo}/releases/{release_id}/assets"
-    a_resp = requests.get(assets_url, headers=headers, timeout=15)
-    if a_resp.status_code == 200:
-        for asset in a_resp.json():
-            if asset.get("name") == asset_name:
-                del_url = f"https://api.github.com/repos/{github_repo}/releases/assets/{asset['id']}"
-                requests.delete(del_url, headers=headers, timeout=15)
+    # Delete existing asset if present to allow clean replacement (with pagination support)
+    page = 1
+    found_asset = None
+    while page <= 10:
+        assets_url = f"https://api.github.com/repos/{github_repo}/releases/{release_id}/assets?per_page=100&page={page}"
+        a_resp = requests.get(assets_url, headers=headers, timeout=15)
+        if a_resp.status_code == 200:
+            assets_chunk = a_resp.json()
+            if not assets_chunk:
                 break
+            for asset in assets_chunk:
+                if asset.get("name") == asset_name:
+                    found_asset = asset
+                    break
+            if found_asset or len(assets_chunk) < 100:
+                break
+            page += 1
+        else:
+            break
+
+    if found_asset:
+        del_url = f"https://api.github.com/repos/{github_repo}/releases/assets/{found_asset['id']}"
+        requests.delete(del_url, headers=headers, timeout=15)
+        time.sleep(1) # Allow GitHub to finalize asset deletion
 
     upload_headers = {
         "Authorization": f"Bearer {github_token}",
@@ -369,6 +384,10 @@ def upload_sub_to_github_release(vtt_text, anime_id, ep_num, github_token, githu
     if up_resp.status_code in (200, 201):
         asset_data = up_resp.json()
         return asset_data.get("browser_download_url")
+    elif up_resp.status_code == 422 and "already_exists" in up_resp.text:
+        # Fallback: Asset already exists on release, construct and return the public CDN URL
+        print(f"ℹ️ Asset '{asset_name}' already registered in release {tag_name}, using CDN URL.", flush=True)
+        return f"https://github.com/{github_repo}/releases/download/{tag_name}/{asset_name}"
     else:
         raise RuntimeError(f"Failed uploading asset: {up_resp.status_code} {up_resp.text}")
 
