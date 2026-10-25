@@ -137,9 +137,26 @@ def fetch_megaplay_english_sub(anime_id, ep_num):
         return None, "MegaPlay stream data-id not found across AniList and MAL endpoints"
 
     sources_url = f"https://megaplay.buzz/stream/getSources?id={data_id}"
-    sources_resp = requests.get(sources_url, headers=headers, timeout=15)
-    if sources_resp.status_code != 200:
-        return None, f"getSources failed with {sources_resp.status_code}"
+    api_headers = {
+        "Referer": "https://megaplay.buzz/",
+        "Origin": "https://megaplay.buzz",
+        "X-Requested-With": "XMLHttpRequest",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    }
+    
+    sources_resp = None
+    for attempt in range(3):
+        try:
+            sources_resp = requests.get(sources_url, headers=api_headers, timeout=15)
+            if sources_resp.status_code == 200:
+                break
+            time.sleep(0.5)
+        except Exception:
+            time.sleep(0.5)
+
+    if not sources_resp or sources_resp.status_code != 200:
+        return None, f"getSources failed with {sources_resp.status_code if sources_resp else 'timeout'}"
 
     data = sources_resp.json()
     tracks = data.get("tracks", [])
@@ -370,17 +387,20 @@ def upload_sub_to_github_release(vtt_text, anime_id, ep_num, github_token, githu
         if chunk_idx > 1:
             release_display_name += f" (Part {chunk_idx})"
 
-        c_resp = requests.post(create_url, headers=headers, json={
+        release_payload = {
             "tag_name": tag_name,
+            "target_commitish": "main",
             "name": release_display_name,
             "body": f"Automated WebVTT Sinhala subtitles for {anime_title or anime_id} (Batch {chunk_idx})",
             "draft": False,
             "prerelease": False
-        }, timeout=15)
+        }
 
-        # Self-healing: If repo is empty, seed a README commit and retry
-        if c_resp.status_code == 422 and "Repository is empty" in c_resp.text:
-            print(f"🌱 Repository '{github_repo}' has no commits. Auto-committing README.md...", flush=True)
+        c_resp = requests.post(create_url, headers=headers, json=release_payload, timeout=15)
+
+        # Self-healing: If repo is empty or target_commitish main failed, seed README and retry
+        if c_resp.status_code == 422:
+            print(f"🌱 GitHub Release validation failed on '{github_repo}'. Checking/committing README.md...", flush=True)
             readme_payload = {
                 "message": "Initial commit - AniShift Sub Vault",
                 "content": "IyBBbmlTaGlmdCBTdWJ0aXRsZSBWYXVsdA==", # Base64 for "# AniShift Subtitle Vault"
@@ -388,13 +408,7 @@ def upload_sub_to_github_release(vtt_text, anime_id, ep_num, github_token, githu
             }
             requests.put(f"https://api.github.com/repos/{github_repo}/contents/README.md", headers=headers, json=readme_payload, timeout=15)
             time.sleep(2)
-            c_resp = requests.post(create_url, headers=headers, json={
-                "tag_name": tag_name,
-                "name": release_display_name,
-                "body": f"Automated WebVTT Sinhala subtitles for {anime_title or anime_id} (Batch {chunk_idx})",
-                "draft": False,
-                "prerelease": False
-            }, timeout=15)
+            c_resp = requests.post(create_url, headers=headers, json=release_payload, timeout=15)
 
         if c_resp.status_code in (200, 201):
             rel_data = c_resp.json()
