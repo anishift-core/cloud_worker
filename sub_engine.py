@@ -47,25 +47,97 @@ def apply_spoken_sinhala(text):
 def has_sinhala_characters(text):
     return bool(re.search(r'[\u0D80-\u0DFF]', str(text)))
 
+def get_fallback_anime_ids(anime_id):
+    """
+    Bidirectional AniList ID <-> MyAnimeList ID resolver using AniList GraphQL API.
+    Resolves both directions:
+    1. If anilist_id is provided, returns corresponding MAL ID.
+    2. If MAL ID is provided, returns corresponding AniList ID.
+    """
+    ids = {"anilist_id": str(anime_id), "mal_id": None}
+    if not anime_id:
+        return ids
+    try:
+        int_id = int(str(anime_id).strip())
+        headers = {"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
+
+        # 1. Try querying as AniList ID
+        q1 = "query ($id: Int) { Media (id: $id, type: ANIME) { id idMal } }"
+        r1 = requests.post("https://graphql.anilist.co", json={"query": q1, "variables": {"id": int_id}}, headers=headers, timeout=5)
+        if r1.status_code == 200:
+            media = r1.json().get("data", {}).get("Media")
+            if media:
+                if media.get("idMal"): ids["mal_id"] = str(media["idMal"])
+                if media.get("id"): ids["anilist_id"] = str(media["id"])
+                return ids
+
+        # 2. Try querying as MAL ID
+        q2 = "query ($idMal: Int) { Media (idMal: $idMal, type: ANIME) { id idMal } }"
+        r2 = requests.post("https://graphql.anilist.co", json={"query": q2, "variables": {"idMal": int_id}}, headers=headers, timeout=5)
+        if r2.status_code == 200:
+            media = r2.json().get("data", {}).get("Media")
+            if media:
+                if media.get("idMal"): ids["mal_id"] = str(media["idMal"])
+                if media.get("id"): ids["anilist_id"] = str(media["id"])
+                return ids
+    except Exception:
+        pass
+    return ids
+
 def fetch_megaplay_english_sub(anime_id, ep_num):
-    """Fetches English .vtt subtitle URL directly from MegaPlay stream metadata"""
-    embed_url = f"https://megaplay.buzz/stream/ani/{anime_id}/{ep_num}/sub"
+    """Fetches English .vtt subtitle URL directly from MegaPlay using AniList ID & MAL ID fallbacks"""
+    candidate_urls = []
+    seen = set()
+
+    def add_cand(url):
+        if url not in seen:
+            seen.add(url)
+            candidate_urls.append(url)
+
+    # 1. Primary input ID endpoints
+    add_cand(f"https://megaplay.buzz/stream/ani/{anime_id}/{ep_num}/sub")
+    add_cand(f"https://megaplay.buzz/stream/mal/{anime_id}/{ep_num}/sub")
+
+    # 2. Resolved MAL & AniList IDs
+    try:
+        id_map = get_fallback_anime_ids(anime_id)
+        mal_id = id_map.get("mal_id")
+        ani_id = id_map.get("anilist_id")
+        if mal_id and str(mal_id) != str(anime_id):
+            add_cand(f"https://megaplay.buzz/stream/mal/{mal_id}/{ep_num}/sub")
+            add_cand(f"https://megaplay.buzz/stream/ani/{mal_id}/{ep_num}/sub")
+        if ani_id and str(ani_id) != str(anime_id):
+            add_cand(f"https://megaplay.buzz/stream/ani/{ani_id}/{ep_num}/sub")
+            add_cand(f"https://megaplay.buzz/stream/mal/{ani_id}/{ep_num}/sub")
+    except Exception:
+        pass
+
+    # 3. Dub endpoints as secondary fallbacks
+    add_cand(f"https://megaplay.buzz/stream/ani/{anime_id}/{ep_num}/dub")
+    add_cand(f"https://megaplay.buzz/stream/mal/{anime_id}/{ep_num}/dub")
+
     headers = {
-        "Referer": "https://anishift.netlify.app/",
+        "Referer": "https://megaplay.buzz/",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     }
 
-    resp = requests.get(embed_url, headers=headers, timeout=15)
-    if resp.status_code in (404, 410):
-        return None, "Episode not found on MegaPlay"
+    data_id = None
+    for embed_url in candidate_urls:
+        try:
+            resp = requests.get(embed_url, headers=headers, timeout=10)
+            if resp.status_code == 200:
+                match = re.search(r'data-id=["\'](\d+)["\']', resp.text)
+                if match:
+                    data_id = match.group(1)
+                    break
+        except Exception:
+            continue
 
-    match = re.search(r'data-id=["\'](\d+)["\']', resp.text)
-    if not match:
-        return None, "MegaPlay data-id not found"
+    if not data_id:
+        return None, "MegaPlay stream data-id not found across AniList and MAL endpoints"
 
-    data_id = match.group(1)
     sources_url = f"https://megaplay.buzz/stream/getSources?id={data_id}"
-    sources_resp = requests.get(sources_url, headers={"Referer": "https://megaplay.buzz/", "User-Agent": headers["User-Agent"]}, timeout=15)
+    sources_resp = requests.get(sources_url, headers=headers, timeout=15)
     if sources_resp.status_code != 200:
         return None, f"getSources failed with {sources_resp.status_code}"
 
@@ -80,14 +152,12 @@ def fetch_megaplay_english_sub(anime_id, ep_num):
             break
 
     if not eng_track_url and tracks:
-        # Fallback to first available subtitle track
         eng_track_url = tracks[0].get("file")
 
     if not eng_track_url:
         return None, "No subtitle track available on MegaPlay"
 
-    # Fetch the actual raw VTT content
-    sub_resp = requests.get(eng_track_url, headers={"Referer": "https://megaplay.buzz/", "User-Agent": headers["User-Agent"]}, timeout=20)
+    sub_resp = requests.get(eng_track_url, headers=headers, timeout=20)
     if sub_resp.status_code != 200:
         return None, f"Failed downloading VTT file: {sub_resp.status_code}"
 
