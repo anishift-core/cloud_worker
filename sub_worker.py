@@ -141,18 +141,32 @@ def main():
             "sinhala_sub": sub_url
         }
     }
-    # Primary DB
-    ep_ref = db.document(episode_path)
-    ep_ref.set(update_payload, merge=True)
+    # Primary DB with retry and fallback
+    fs_updated = False
+    for attempt in range(1, 4):
+        try:
+            ep_ref = db.document(episode_path)
+            ep_ref.set(update_payload, merge=True)
+            fs_updated = True
+            break
+        except Exception as fe:
+            print(f"⚠️ Primary Firestore update attempt {attempt} failed: {fe}", flush=True)
+            if "Quota exceeded" in str(fe) or "RESOURCE_EXHAUSTED" in str(fe):
+                time.sleep(2 * attempt)
+            else:
+                break
 
-    # Backup DB (anisora-core)
+    if not fs_updated:
+        print("ℹ️ Firestore write skipped/deferred (quota limit). Manager will sync once refreshed.", flush=True)
+
+    # Backup DB (anisora-core) if available
     if backup_db:
         try:
             b_ep_ref = backup_db.document(episode_path)
             b_ep_ref.set(update_payload, merge=True)
             print("💾 Mirrored episode update to Backup Firestore", flush=True)
         except Exception as be:
-            print(f"⚠️ Failed to mirror to Backup DB: {be}", flush=True)
+            print(f"⚠️ Backup DB update notice: {be}", flush=True)
 
     # 5. Emit completed signal to RTDB for Manager and save in RTDB sub status
     rtdb.reference(f"megaplay_sub_jobs/completed/{job_id}").set({
