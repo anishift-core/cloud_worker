@@ -176,14 +176,6 @@ def main():
         "ep_num": ep_num,
         "timestamp": time.time()
     })
-    # Cache under anime status so manager knows it's done without Firestore reads
-    try:
-        rtdb.reference(f"megaplay_sub_status/{anime_id}/episodes/{ep_num}").set({
-            "url": sub_url,
-            "updated_at": time.time()
-        })
-    except Exception:
-        pass
 
     print(f"🎉 Job {job_id} finished 100% successfully!", flush=True)
 
