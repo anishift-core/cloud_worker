@@ -398,17 +398,36 @@ def upload_sub_to_github_release(vtt_text, anime_id, ep_num, github_token, githu
 
         c_resp = requests.post(create_url, headers=headers, json=release_payload, timeout=15)
 
-        # Self-healing: If repo is empty or target_commitish main failed, seed README and retry
+        # Self-healing: If tag already exists (422 already_exists) or commitish failed
         if c_resp.status_code == 422:
-            print(f"🌱 GitHub Release validation failed on '{github_repo}'. Checking/committing README.md...", flush=True)
-            readme_payload = {
-                "message": "Initial commit - AniShift Sub Vault",
-                "content": "IyBBbmlTaGlmdCBTdWJ0aXRsZSBWYXVsdA==", # Base64 for "# AniShift Subtitle Vault"
-                "branch": "main"
-            }
-            requests.put(f"https://api.github.com/repos/{github_repo}/contents/README.md", headers=headers, json=readme_payload, timeout=15)
-            time.sleep(2)
-            c_resp = requests.post(create_url, headers=headers, json=release_payload, timeout=15)
+            resp_txt = c_resp.text
+            if "already_exists" in resp_txt:
+                print(f"🔄 Release or tag '{tag_name}' already exists in '{github_repo}'. Retrieving existing release...", flush=True)
+                # First try fetching via tag again (might have been created concurrently or as a git tag)
+                time.sleep(1)
+                retry_rel = requests.get(rel_url, headers=headers, timeout=15)
+                if retry_rel.status_code == 200:
+                    c_resp = retry_rel
+                else:
+                    # Search through releases list by tag_name
+                    list_rel = requests.get(f"https://api.github.com/repos/{github_repo}/releases?per_page=100", headers=headers, timeout=15)
+                    if list_rel.status_code == 200:
+                        for r_item in list_rel.json():
+                            if r_item.get("tag_name") == tag_name:
+                                c_resp = requests.Response()
+                                c_resp.status_code = 200
+                                c_resp._content = json.dumps(r_item).encode('utf-8')
+                                break
+            else:
+                print(f"🌱 GitHub Release validation failed on '{github_repo}'. Checking/committing README.md...", flush=True)
+                readme_payload = {
+                    "message": "Initial commit - AniShift Sub Vault",
+                    "content": "IyBBbmlTaGlmdCBTdWJ0aXRsZSBWYXVsdA==", # Base64 for "# AniShift Subtitle Vault"
+                    "branch": "main"
+                }
+                requests.put(f"https://api.github.com/repos/{github_repo}/contents/README.md", headers=headers, json=readme_payload, timeout=15)
+                time.sleep(2)
+                c_resp = requests.post(create_url, headers=headers, json=release_payload, timeout=15)
 
         if c_resp.status_code in (200, 201):
             rel_data = c_resp.json()
