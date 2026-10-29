@@ -172,6 +172,7 @@ def main():
     rtdb.reference(f"megaplay_sub_jobs/completed/{job_id}").set({
         "status": "success",
         "url": sub_url,
+        "fs_updated": fs_updated,
         "anime_id": anime_id,
         "ep_num": ep_num,
         "timestamp": time.time()
