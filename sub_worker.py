@@ -136,6 +136,7 @@ def main():
     # 4. Save in Firestore episode document matching our stream.sinhala_sub structure
     print(f"💾 Updating Firestore document: {episode_path}...", flush=True)
     update_payload = {
+        "episode_number": ep_num,
         "status": "uploaded",
         "stream": {
             "sinhala_sub": sub_url
