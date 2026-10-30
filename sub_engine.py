@@ -160,16 +160,63 @@ def fetch_megaplay_english_sub(anime_id, ep_num):
 
     data = sources_resp.json()
     tracks = data.get("tracks", [])
-    eng_track_url = None
-    for t in tracks:
-        file_url = t.get("file", "")
-        label = (t.get("label") or "").lower()
-        if "english" in label or "eng" in file_url:
-            eng_track_url = file_url
-            break
 
-    if not eng_track_url and tracks:
-        eng_track_url = tracks[0].get("file")
+    # Filter only subtitle/caption tracks (exclude "thumbnails" tracks)
+    sub_tracks = [
+        t for t in tracks
+        if t.get("file") and (t.get("kind") or "captions").lower() in ("captions", "subtitles", "")
+        and "thumbnail" not in (t.get("kind") or "").lower()
+        and "sprite" not in (t.get("file") or "").lower()
+    ]
+
+    def score_english_track(t):
+        label = (t.get("label") or "").strip().lower()
+        file_url = (t.get("file") or "").strip().lower()
+        is_default = bool(t.get("default"))
+
+        is_eng = ("english" in label) or (label in ("en", "eng")) or ("eng" in file_url)
+        if not is_eng:
+            return -100  # Not an English track
+
+        # Penalize Forced / Signs & Songs tracks heavily (they only contain sign/title translations, not full dialogue!)
+        is_forced = any(w in label for w in ("forced", "sign", "song", "caption")) or "forced" in file_url
+        if is_forced:
+            return 10
+
+        # Exact "English" (full original subtitle track) gets highest priority!
+        if label in ("english", "en", "eng", "english (us)", "english [full]", "english (full)"):
+            return 100 + (5 if is_default else 0)
+
+        # Secondary full English tracks: English (SDH), English (CC)
+        if "sdh" in label or "cc" in label:
+            return 85 + (5 if is_default else 0)
+
+        # English (Dubtitle)
+        if "dubtitle" in label or "dub" in label:
+            return 75 + (5 if is_default else 0)
+
+        # Any other non-forced English track
+        return 70 + (5 if is_default else 0)
+
+    scored_tracks = []
+    for t in sub_tracks:
+        s = score_english_track(t)
+        if s > 0:
+            scored_tracks.append((s, t))
+
+    scored_tracks.sort(key=lambda x: x[0], reverse=True)
+
+    eng_track_url = None
+    selected_label = None
+    if scored_tracks:
+        best_track = scored_tracks[0][1]
+        eng_track_url = best_track.get("file")
+        selected_label = best_track.get("label") or "English"
+        print(f"🎯 Selected English Subtitle Track: '{selected_label}' (Score: {scored_tracks[0][0]})", flush=True)
+    elif sub_tracks:
+        eng_track_url = sub_tracks[0].get("file")
+        selected_label = sub_tracks[0].get("label") or "Fallback Track"
+        print(f"⚠️ No explicit English label found, falling back to first subtitle track: '{selected_label}'", flush=True)
 
     if not eng_track_url:
         return None, "No subtitle track available on MegaPlay"
@@ -178,7 +225,24 @@ def fetch_megaplay_english_sub(anime_id, ep_num):
     if sub_resp.status_code != 200:
         return None, f"Failed downloading VTT file: {sub_resp.status_code}"
 
-    return sub_resp.text, None
+    # Safety fallback: if multiple English tracks exist and the chosen track has very few cues (< 35 lines, e.g. unlabelled forced track),
+    # check the next best English track to see if it has the full dialogue!
+    vtt_text = sub_resp.text
+    if len(scored_tracks) > 1 and vtt_text.count("-->") < 35:
+        for alt_score, alt_track in scored_tracks[1:]:
+            alt_url = alt_track.get("file")
+            if not alt_url or alt_url == eng_track_url:
+                continue
+            try:
+                alt_resp = requests.get(alt_url, headers=headers, timeout=20)
+                if alt_resp.status_code == 200 and alt_resp.text.count("-->") > vtt_text.count("-->") * 2:
+                    print(f"🔄 Switched from short track '{selected_label}' ({vtt_text.count('-->')} cues) to full track '{alt_track.get('label')}' ({alt_resp.text.count('-->')} cues)!", flush=True)
+                    vtt_text = alt_resp.text
+                    break
+            except Exception:
+                pass
+
+    return vtt_text, None
 
 def parse_vtt_cues(vtt_text):
     """Extracts (timecode, text) cues from WebVTT"""
