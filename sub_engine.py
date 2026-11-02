@@ -136,14 +136,14 @@ def fetch_megaplay_english_sub(anime_id, ep_num, title=None):
     # 4. Anikoto / HiAnime Fallback if not found by AniList or MAL
     if not data_id and title:
         try:
-            s_url = f"https://anikototvapi.vercel.app/api/search?keyword={requests.utils.quote(str(title))}"
+            # Query anikoto.cz directly without third-party intermediate proxies
+            s_url = f"https://anikoto.cz/search?keyword={requests.utils.quote(str(title))}"
             s_resp = requests.get(s_url, headers={"User-Agent": headers["User-Agent"]}, timeout=10)
             if s_resp.status_code == 200:
-                s_data = s_resp.json()
-                hits = s_data.get("results", {}).get("data", [])
-                best_hit = next((h for h in hits if h.get("type") == "TV"), hits[0] if hits else None)
-                if best_hit and best_hit.get("animeId"):
-                    series_url = f"https://anikotoapi.site/series/{best_hit['animeId']}"
+                tip_match = re.search(r'data-tip=["\'](\d+)["\']', s_resp.text)
+                if tip_match:
+                    series_id = tip_match.group(1)
+                    series_url = f"https://anikotoapi.site/series/{series_id}"
                     ser_resp = requests.get(series_url, headers={"User-Agent": headers["User-Agent"]}, timeout=10)
                     if ser_resp.status_code == 200:
                         episodes = ser_resp.json().get("data", {}).get("episodes", [])
