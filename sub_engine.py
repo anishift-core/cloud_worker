@@ -84,8 +84,8 @@ def get_fallback_anime_ids(anime_id):
         pass
     return ids
 
-def fetch_megaplay_english_sub(anime_id, ep_num):
-    """Fetches English .vtt subtitle URL directly from MegaPlay using AniList ID & MAL ID fallbacks"""
+def fetch_megaplay_english_sub(anime_id, ep_num, title=None):
+    """Fetches English .vtt subtitle URL directly from MegaPlay using AniList ID, MAL ID, and Anikoto fallbacks"""
     candidate_urls = []
     seen = set()
 
@@ -133,8 +133,33 @@ def fetch_megaplay_english_sub(anime_id, ep_num):
         except Exception:
             continue
 
+    # 4. Anikoto / HiAnime Fallback if not found by AniList or MAL
+    if not data_id and title:
+        try:
+            s_url = f"https://anikototvapi.vercel.app/api/search?keyword={requests.utils.quote(str(title))}"
+            s_resp = requests.get(s_url, headers={"User-Agent": headers["User-Agent"]}, timeout=10)
+            if s_resp.status_code == 200:
+                s_data = s_resp.json()
+                hits = s_data.get("results", {}).get("data", [])
+                best_hit = next((h for h in hits if h.get("type") == "TV"), hits[0] if hits else None)
+                if best_hit and best_hit.get("animeId"):
+                    series_url = f"https://anikotoapi.site/series/{best_hit['animeId']}"
+                    ser_resp = requests.get(series_url, headers={"User-Agent": headers["User-Agent"]}, timeout=10)
+                    if ser_resp.status_code == 200:
+                        episodes = ser_resp.json().get("data", {}).get("episodes", [])
+                        matching_ep = next((e for e in episodes if str(e.get("number")) == str(ep_num)), None)
+                        if matching_ep and matching_ep.get("episode_embed_id"):
+                            s2_url = f"https://megaplay.buzz/stream/s-2/{matching_ep['episode_embed_id']}/sub"
+                            s2_resp = requests.get(s2_url, headers=headers, timeout=10)
+                            if s2_resp.status_code == 200:
+                                m = re.search(r'data-id=["\'](\d+)["\']', s2_resp.text)
+                                if m:
+                                    data_id = m.group(1)
+        except Exception:
+            pass
+
     if not data_id:
-        return None, "MegaPlay stream data-id not found across AniList and MAL endpoints"
+        return None, "MegaPlay stream data-id not found across AniList, MAL, and Anikoto endpoints"
 
     sources_url = f"https://megaplay.buzz/stream/getSources?id={data_id}"
     api_headers = {

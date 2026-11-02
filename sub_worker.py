@@ -84,14 +84,15 @@ def main():
     anime_id = str(payload.get("anime_id"))
     ep_num = int(payload.get("ep_num", 1))
     episode_path = payload.get("episode_path")
+    anime_title = payload.get("title") or payload.get("anime_title") or payload.get("name") or None
 
     print(f"🎬 [CloudSubWorker] Starting Job {job_id}: Anime {anime_id} EP {ep_num} ({episode_path})", flush=True)
 
     db = init_firebase()
 
-    # 1. Fetch English Subtitle from MegaPlay
+    # 1. Fetch English Subtitle from MegaPlay (AniList -> MAL -> Anikoto fallback)
     print(f"📥 Fetching English Subtitle from MegaPlay...", flush=True)
-    eng_vtt, err = fetch_megaplay_english_sub(anime_id, ep_num)
+    eng_vtt, err = fetch_megaplay_english_sub(anime_id, ep_num, title=anime_title)
     if err or not eng_vtt:
         print(f"⚠️ Failed fetching English sub: {err}", flush=True)
         # Notify RTDB of failure
