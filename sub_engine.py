@@ -84,6 +84,83 @@ def get_fallback_anime_ids(anime_id):
         pass
     return ids
 
+def resolve_megaplay_via_anikoto(title, ep_num):
+    """
+    Directly scrapes anikoto.cz to get the exact episode embed and MegaPlay data-id.
+    Works for any anime where AniList/MAL endpoints have dead/stale stream IDs or missing episodes.
+    """
+    if not title:
+        return None
+    try:
+        s = requests.Session()
+        ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+        s.headers.update({"User-Agent": ua})
+
+        # 1. Search Anikoto
+        s_url = f"https://anikoto.cz/search?keyword={requests.utils.quote(str(title))}"
+        s_resp = s.get(s_url, timeout=10)
+        if s_resp.status_code != 200:
+            return None
+
+        m_watch = re.search(r'href=["\'](https?://anikoto\.cz/watch/[^"\']+|/watch/[^"\']+)["\']', s_resp.text)
+        if not m_watch:
+            return None
+        watch_link = m_watch.group(1)
+        if not watch_link.startswith("http"):
+            watch_link = "https://anikoto.cz" + watch_link
+
+        # 2. Get series data-id
+        wr = s.get(watch_link, timeout=10)
+        dids = re.findall(r'data-id=["\'](\d+)["\']', wr.text)
+        if not dids:
+            return None
+        series_id = dids[0]
+
+        # 3. Episode list
+        ep_list_url = f"https://anikoto.cz/ajax/episode/list/{series_id}"
+        ep_res = s.get(ep_list_url, headers={"X-Requested-With": "XMLHttpRequest", "Referer": watch_link}, timeout=10).json()
+        ep_html = ep_res.get("result", "")
+
+        target_data_ids = None
+        for tag_match in re.finditer(r'<a\b[^>]*>', ep_html, re.IGNORECASE):
+            tag = tag_match.group(0)
+            m_num = re.search(r'\bdata-num=["\']?(\d+)["\']?', tag, re.IGNORECASE)
+            if m_num and int(m_num.group(1)) == int(ep_num):
+                m_ids = re.search(r'\bdata-ids=["\']([^"\']+)["\']', tag, re.IGNORECASE)
+                if m_ids:
+                    target_data_ids = m_ids.group(1)
+                    break
+
+        if not target_data_ids:
+            return None
+
+        # 4. Server list
+        server_list_url = f"https://anikoto.cz/ajax/server/list?servers={requests.utils.quote(target_data_ids)}"
+        srv_res = s.get(server_list_url, headers={"X-Requested-With": "XMLHttpRequest", "Referer": watch_link}, timeout=10).json()
+        srv_html = srv_res.get("result", "")
+
+        m_links = re.findall(r'data-link-id=["\']([^"\']+)["\']', srv_html)
+        if not m_links:
+            return None
+        link_id = m_links[0]
+
+        # 5. Server stream URL
+        srv_url = f"https://anikoto.cz/ajax/server?get={requests.utils.quote(link_id)}"
+        get_res = s.get(srv_url, headers={"X-Requested-With": "XMLHttpRequest", "Referer": watch_link}, timeout=10).json()
+        stream_url = get_res.get("result", {}).get("url")
+        if not stream_url:
+            return None
+
+        # 6. Extract data-id from MegaPlay embed page
+        mr = s.get(stream_url, headers={"Referer": "https://megaplay.buzz/"}, timeout=10)
+        m_ids = re.findall(r'data-id=["\'](\d+)["\']', mr.text)
+        if m_ids:
+            print(f"🎬 [Anikoto Fallback] Successfully resolved working MegaPlay stream data-id: {m_ids[0]} for '{title}' EP {ep_num}", flush=True)
+            return m_ids[0]
+    except Exception as e:
+        print(f"⚠️ [Anikoto Fallback] Error: {e}", flush=True)
+    return None
+
 def fetch_megaplay_english_sub(anime_id, ep_num, title=None):
     """Fetches English .vtt subtitle URL directly from MegaPlay using AniList ID, MAL ID, and Anikoto fallbacks"""
     candidate_urls = []
@@ -121,70 +198,66 @@ def fetch_megaplay_english_sub(anime_id, ep_num, title=None):
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     }
 
+    def verify_get_sources(did):
+        """Helper to test if a MegaPlay data-id actually produces valid sources"""
+        if not did:
+            return None
+        sources_url = f"https://megaplay.buzz/stream/getSources?id={did}"
+        api_headers = {
+            "Referer": "https://megaplay.buzz/",
+            "Origin": "https://megaplay.buzz",
+            "X-Requested-With": "XMLHttpRequest",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+        }
+        for _ in range(2):
+            try:
+                resp = requests.get(sources_url, headers=api_headers, timeout=10)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data.get("tracks") or data.get("sources"):
+                        return data
+                time.sleep(0.3)
+            except Exception:
+                time.sleep(0.3)
+        return None
+
+    sources_data = None
     data_id = None
+
+    # Step 1: Try candidate URLs (AniList & MAL)
     for embed_url in candidate_urls:
         try:
             resp = requests.get(embed_url, headers=headers, timeout=10)
             if resp.status_code == 200:
                 match = re.search(r'data-id=["\'](\d+)["\']', resp.text)
                 if match:
-                    data_id = match.group(1)
-                    break
+                    candidate_did = match.group(1)
+                    # Verify sources work! If MegaPlay has broken/404 data-id, do NOT stop here!
+                    verified_data = verify_get_sources(candidate_did)
+                    if verified_data:
+                        data_id = candidate_did
+                        sources_data = verified_data
+                        break
+                    else:
+                        print(f"⚠️ Embed {embed_url} returned data-id {candidate_did}, but getSources failed/404. Falling back...", flush=True)
         except Exception:
             continue
 
-    # 4. Anikoto / HiAnime Fallback if not found by AniList or MAL
-    if not data_id and title:
-        try:
-            # Query anikoto.cz directly without third-party intermediate proxies
-            s_url = f"https://anikoto.cz/search?keyword={requests.utils.quote(str(title))}"
-            s_resp = requests.get(s_url, headers={"User-Agent": headers["User-Agent"]}, timeout=10)
-            if s_resp.status_code == 200:
-                tip_match = re.search(r'data-tip=["\'](\d+)["\']', s_resp.text)
-                if tip_match:
-                    series_id = tip_match.group(1)
-                    series_url = f"https://anikotoapi.site/series/{series_id}"
-                    ser_resp = requests.get(series_url, headers={"User-Agent": headers["User-Agent"]}, timeout=10)
-                    if ser_resp.status_code == 200:
-                        episodes = ser_resp.json().get("data", {}).get("episodes", [])
-                        matching_ep = next((e for e in episodes if str(e.get("number")) == str(ep_num)), None)
-                        if matching_ep and matching_ep.get("episode_embed_id"):
-                            s2_url = f"https://megaplay.buzz/stream/s-2/{matching_ep['episode_embed_id']}/sub"
-                            s2_resp = requests.get(s2_url, headers=headers, timeout=10)
-                            if s2_resp.status_code == 200:
-                                m = re.search(r'data-id=["\'](\d+)["\']', s2_resp.text)
-                                if m:
-                                    data_id = m.group(1)
-        except Exception:
-            pass
+    # Step 2: Anikoto Fallback if AniList/MAL failed or their getSources returned 404/broken
+    if not sources_data and title:
+        print(f"🔄 Triggering Anikoto Fallback for '{title}' EP {ep_num}...", flush=True)
+        anikoto_did = resolve_megaplay_via_anikoto(title, ep_num)
+        if anikoto_did:
+            verified_data = verify_get_sources(anikoto_did)
+            if verified_data:
+                data_id = anikoto_did
+                sources_data = verified_data
 
-    if not data_id:
-        return None, "MegaPlay stream data-id not found across AniList, MAL, and Anikoto endpoints"
+    if not data_id or not sources_data:
+        return None, "MegaPlay stream data-id not found or getSources returned 404 across AniList, MAL, and Anikoto"
 
-    sources_url = f"https://megaplay.buzz/stream/getSources?id={data_id}"
-    api_headers = {
-        "Referer": "https://megaplay.buzz/",
-        "Origin": "https://megaplay.buzz",
-        "X-Requested-With": "XMLHttpRequest",
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-    }
-    
-    sources_resp = None
-    for attempt in range(3):
-        try:
-            sources_resp = requests.get(sources_url, headers=api_headers, timeout=15)
-            if sources_resp.status_code == 200:
-                break
-            time.sleep(0.5)
-        except Exception:
-            time.sleep(0.5)
-
-    if not sources_resp or sources_resp.status_code != 200:
-        return None, f"getSources failed with {sources_resp.status_code if sources_resp else 'timeout'}"
-
-    data = sources_resp.json()
-    tracks = data.get("tracks", [])
+    tracks = sources_data.get("tracks", [])
 
     # Filter only subtitle/caption tracks (exclude "thumbnails" tracks)
     sub_tracks = [
