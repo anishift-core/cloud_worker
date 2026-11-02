@@ -86,8 +86,8 @@ def get_fallback_anime_ids(anime_id):
 
 def resolve_megaplay_via_anikoto(title, ep_num):
     """
-    Directly scrapes anikoto.cz to get the exact episode embed and MegaPlay data-id.
-    Works for any anime where AniList/MAL endpoints have dead/stale stream IDs or missing episodes.
+    Directly resolves episode stream using Anikoto Search and https://anikotoapi.site/series/{series_id}.
+    Works 100% reliably for any anime where AniList/MAL endpoints have dead/stale stream IDs or missing episodes.
     """
     if not title:
         return None
@@ -96,27 +96,56 @@ def resolve_megaplay_via_anikoto(title, ep_num):
         ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
         s.headers.update({"User-Agent": ua})
 
-        # 1. Search Anikoto
-        s_url = f"https://anikoto.cz/search?keyword={requests.utils.quote(str(title))}"
-        s_resp = s.get(s_url, timeout=10)
-        if s_resp.status_code != 200:
+        # 1. Search Anikoto using fast AJAX search
+        search_url = f"https://anikoto.cz/ajax/anime/search?keyword={requests.utils.quote(str(title))}"
+        r = s.get(search_url, headers={"X-Requested-With": "XMLHttpRequest"}, timeout=10)
+        watch_link = None
+        if r.status_code == 200:
+            html = r.json().get("result", {}).get("html", "")
+            m = re.findall(r'href=[\'"](https?://anikoto\.cz/watch/[^/\'"]+|/watch/[^/\'"]+)', html)
+            if m:
+                watch_link = m[0]
+                if not watch_link.startswith("http"):
+                    watch_link = "https://anikoto.cz" + watch_link
+
+        # Fallback to standard web search if AJAX search had no results
+        if not watch_link:
+            s_url = f"https://anikoto.cz/search?keyword={requests.utils.quote(str(title))}"
+            s_resp = s.get(s_url, timeout=10)
+            if s_resp.status_code == 200:
+                m_watch = re.search(r'href=[\'"](https?://anikoto\.cz/watch/[^/\'"]+|/watch/[^/\'"]+)[\'"]', s_resp.text)
+                if m_watch:
+                    watch_link = m_watch.group(1)
+                    if not watch_link.startswith("http"):
+                        watch_link = "https://anikoto.cz" + watch_link
+
+        if not watch_link:
             return None
 
-        m_watch = re.search(r'href=["\'](https?://anikoto\.cz/watch/[^"\']+|/watch/[^"\']+)["\']', s_resp.text)
-        if not m_watch:
-            return None
-        watch_link = m_watch.group(1)
-        if not watch_link.startswith("http"):
-            watch_link = "https://anikoto.cz" + watch_link
-
-        # 2. Get series data-id
+        # 2. Get Series ID from the watch page
         wr = s.get(watch_link, timeout=10)
-        dids = re.findall(r'data-id=["\'](\d+)["\']', wr.text)
+        dids = re.findall(r'data-id=[\'"](\d+)[\'"]', wr.text)
         if not dids:
             return None
         series_id = dids[0]
 
-        # 3. Episode list
+        # 3. Use anikotoapi.site/series/{series_id} for instant and accurate episode embed resolution
+        api_url = f"https://anikotoapi.site/series/{series_id}"
+        api_res = s.get(api_url, timeout=10)
+        if api_res.status_code == 200:
+            episodes = api_res.json().get("data", {}).get("episodes", [])
+            target_ep = next((e for e in episodes if int(e.get("number", 0)) == int(ep_num)), None)
+            if target_ep:
+                embed_id = target_ep.get("episode_embed_id")
+                embed_url = target_ep.get("embed_url", {}).get("sub") or f"https://megaplay.buzz/stream/s-2/{embed_id}/sub"
+                # Fetch MegaPlay embed page to extract data-id
+                mr = s.get(embed_url, headers={"Referer": "https://megaplay.buzz/"}, timeout=10)
+                m_ids = re.findall(r'data-id=[\'"](\d+)[\'"]', mr.text)
+                if m_ids:
+                    print(f"🎬 [AnikotoAPI] Successfully resolved working MegaPlay stream data-id: {m_ids[0]} via Series {series_id} for '{title}' EP {ep_num}", flush=True)
+                    return m_ids[0]
+
+        # 4. Fallback: Parse episode list directly via anikoto AJAX if anikotoapi.site was unreachable
         ep_list_url = f"https://anikoto.cz/ajax/episode/list/{series_id}"
         ep_res = s.get(ep_list_url, headers={"X-Requested-With": "XMLHttpRequest", "Referer": watch_link}, timeout=10).json()
         ep_html = ep_res.get("result", "")
@@ -124,39 +153,29 @@ def resolve_megaplay_via_anikoto(title, ep_num):
         target_data_ids = None
         for tag_match in re.finditer(r'<a\b[^>]*>', ep_html, re.IGNORECASE):
             tag = tag_match.group(0)
-            m_num = re.search(r'\bdata-num=["\']?(\d+)["\']?', tag, re.IGNORECASE)
+            m_num = re.search(r'\bdata-num=[\'"]?(\d+)[\'"]?', tag, re.IGNORECASE)
             if m_num and int(m_num.group(1)) == int(ep_num):
-                m_ids = re.search(r'\bdata-ids=["\']([^"\']+)["\']', tag, re.IGNORECASE)
+                m_ids = re.search(r'\bdata-ids=[\'"]([^\'"]+)[\'"]', tag, re.IGNORECASE)
                 if m_ids:
                     target_data_ids = m_ids.group(1)
                     break
 
-        if not target_data_ids:
-            return None
+        if target_data_ids:
+            server_list_url = f"https://anikoto.cz/ajax/server/list?servers={requests.utils.quote(target_data_ids)}"
+            srv_res = s.get(server_list_url, headers={"X-Requested-With": "XMLHttpRequest", "Referer": watch_link}, timeout=10).json()
+            srv_html = srv_res.get("result", "")
+            m_links = re.findall(r'data-link-id=[\'"]([^\'"]+)[\'"]', srv_html)
+            if m_links:
+                srv_url = f"https://anikoto.cz/ajax/server?get={requests.utils.quote(m_links[0])}"
+                get_res = s.get(srv_url, headers={"X-Requested-With": "XMLHttpRequest", "Referer": watch_link}, timeout=10).json()
+                stream_url = get_res.get("result", {}).get("url")
+                if stream_url:
+                    mr = s.get(stream_url, headers={"Referer": "https://megaplay.buzz/"}, timeout=10)
+                    m_ids = re.findall(r'data-id=[\'"](\d+)[\'"]', mr.text)
+                    if m_ids:
+                        print(f"🎬 [Anikoto Scraper] Successfully resolved MegaPlay stream data-id: {m_ids[0]} for '{title}' EP {ep_num}", flush=True)
+                        return m_ids[0]
 
-        # 4. Server list
-        server_list_url = f"https://anikoto.cz/ajax/server/list?servers={requests.utils.quote(target_data_ids)}"
-        srv_res = s.get(server_list_url, headers={"X-Requested-With": "XMLHttpRequest", "Referer": watch_link}, timeout=10).json()
-        srv_html = srv_res.get("result", "")
-
-        m_links = re.findall(r'data-link-id=["\']([^"\']+)["\']', srv_html)
-        if not m_links:
-            return None
-        link_id = m_links[0]
-
-        # 5. Server stream URL
-        srv_url = f"https://anikoto.cz/ajax/server?get={requests.utils.quote(link_id)}"
-        get_res = s.get(srv_url, headers={"X-Requested-With": "XMLHttpRequest", "Referer": watch_link}, timeout=10).json()
-        stream_url = get_res.get("result", {}).get("url")
-        if not stream_url:
-            return None
-
-        # 6. Extract data-id from MegaPlay embed page
-        mr = s.get(stream_url, headers={"Referer": "https://megaplay.buzz/"}, timeout=10)
-        m_ids = re.findall(r'data-id=["\'](\d+)["\']', mr.text)
-        if m_ids:
-            print(f"🎬 [Anikoto Fallback] Successfully resolved working MegaPlay stream data-id: {m_ids[0]} for '{title}' EP {ep_num}", flush=True)
-            return m_ids[0]
     except Exception as e:
         print(f"⚠️ [Anikoto Fallback] Error: {e}", flush=True)
     return None
