@@ -108,6 +108,8 @@ def extract_episode_number_from_filename(filename):
     Examples:
     - 'Bleach - 01 [1080p].vtt' -> 1
     - '[SubsPlease] One Piece - 1089 (1080p).srt' -> 1089
+    - '(B-A)Hajime_no_Ippo_-_Round_71_(14F59B95).srt' -> 71
+    - '(B-A)Hajime_no_Ippo_-_Round_61v2_(BD534F9B).srt' -> 61
     - 'Demon Slayer S03E05.srt' -> 5
     - 'Attack on Titan Episode 12 Sinhala.vtt' -> 12
     - 'ep_03_sinhala.vtt' -> 3
@@ -119,18 +121,22 @@ def extract_episode_number_from_filename(filename):
     base = re.sub(r'\.[a-zA-Z0-9]+$', '', str(filename))
     clean = re.sub(r'\[[^\]]*\]|\([^\)]*\)', ' ', base).strip()
 
+    # 1. Season and Episode pattern: S01E05 or S2E12
     m = re.search(r'[sS]\d+[\s._-]*[eE](\d+)', clean)
     if m:
         return int(m.group(1))
 
-    m = re.search(r'(?:ep|ep\.|episode|e)[\s._-]*(\d+)', clean, re.IGNORECASE)
+    # 2. Explicit keywords: ep, episode, round, act, chapter
+    m = re.search(r'(?:ep|ep\.|episode|round|act|chapter)[\s._-]*(\d+)', clean, re.IGNORECASE)
     if m:
         return int(m.group(1))
 
-    m = re.search(r'[-_]\s*(\d+)\s*(?:$|[-_])', clean)
+    # 3. Hyphen / underscore separated number (with optional v2/v3 suffix)
+    m = re.search(r'[-_]\s*(\d+)(?:[vV]\d+)?\s*(?:$|[-_])', clean)
     if m:
         return int(m.group(1))
 
+    # 4. Fallback: find all numbers, excluding standard resolutions and years
     nums = re.findall(r'\b\d+\b', clean)
     if nums:
         filtered = [int(n) for n in nums if int(n) not in (1080, 720, 480, 360, 2160) and not (1950 <= int(n) <= 2030 and len(n) == 4)]

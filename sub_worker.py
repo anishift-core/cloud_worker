@@ -120,26 +120,33 @@ def main():
                     print(f"📦 Custom URL is a ZIP archive! Extracting subtitle for Episode {ep_num}...", flush=True)
                     with zipfile.ZipFile(zip_buf, "r") as zf:
                         found_vtt = None
-                        fallback_vtt = None
+                        matched_fname = None
                         for fname in zf.namelist():
                             if fname.endswith("/") or "__MACOSX" in fname:
                                 continue
                             fl = fname.lower()
                             if fl.endswith(".vtt") or fl.endswith(".srt") or fl.endswith(".ass") or fl.endswith(".sub"):
                                 extracted_ep = extract_episode_number_from_filename(fname)
-                                raw_txt = zf.read(fname).decode("utf-8", errors="replace")
-                                vtt_txt = convert_srt_to_vtt(raw_txt)
                                 if extracted_ep == ep_num:
-                                    found_vtt = vtt_txt
-                                    print(f"✅ Found exact match in ZIP for Ep {ep_num}: {fname}", flush=True)
+                                    raw_txt = zf.read(fname).decode("utf-8-sig", errors="replace")
+                                    found_vtt = convert_srt_to_vtt(raw_txt)
+                                    matched_fname = fname
+                                    print(f"✅ Found exact match in ZIP for Ep {ep_num}: {fname} ({len(found_vtt)} bytes)", flush=True)
                                     break
-                                elif fallback_vtt is None:
-                                    fallback_vtt = vtt_txt
-                        raw_sub_text = found_vtt or fallback_vtt
+
+                        if found_vtt:
+                            raw_sub_text = found_vtt
+                        else:
+                            print(f"⚠️ Episode {ep_num} not found inside ZIP archive!", flush=True)
                 else:
-                    raw_sub_text = content_bytes.decode("utf-8", errors="replace")
-                    raw_sub_text = convert_srt_to_vtt(raw_sub_text)
-                    print(f"✅ Successfully downloaded custom subtitle ({len(raw_sub_text)} bytes)", flush=True)
+                    # Single subtitle file download
+                    decoded = content_bytes.decode("utf-8-sig", errors="replace")
+                    # Sanity check: Ensure it's actual subtitle content and not an HTML error page!
+                    if "<!DOCTYPE" in decoded or "<html" in decoded.lower():
+                        print(f"⚠️ Downloaded custom sub URL returned an HTML webpage instead of subtitle text!", flush=True)
+                    else:
+                        raw_sub_text = convert_srt_to_vtt(decoded)
+                        print(f"✅ Successfully downloaded custom subtitle ({len(raw_sub_text)} bytes)", flush=True)
             else:
                 print(f"❌ Failed to download custom sub: HTTP {resp.status_code}", flush=True)
         except Exception as ce:
