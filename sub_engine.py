@@ -47,6 +47,61 @@ def apply_spoken_sinhala(text):
 def has_sinhala_characters(text):
     return bool(re.search(r'[\u0D80-\u0DFF]', str(text)))
 
+def adjust_vtt_timing(vtt_text, shift_sec):
+    """
+    Shifts all WebVTT timestamp cues by shift_sec seconds (positive or negative).
+    Supports 00:00:00.000 and 00:00.000 cue formats.
+    """
+    if not shift_sec or abs(float(shift_sec)) < 0.001:
+        return vtt_text
+
+    shift = float(shift_sec)
+
+    def shift_match(match):
+        h = int(match.group(1)) if match.group(1) is not None else 0
+        m = int(match.group(2))
+        s = int(match.group(3))
+        ms = int(match.group(4))
+        total_sec = h * 3600 + m * 60 + s + ms / 1000.0
+        new_sec = max(0.0, total_sec + shift)
+        new_h = int(new_sec // 3600)
+        rem = new_sec % 3600
+        new_m = int(rem // 60)
+        rem = rem % 60
+        new_s = int(rem)
+        new_ms = int(round((rem - new_s) * 1000))
+        if new_ms >= 1000:
+            new_s += 1
+            new_ms -= 1000
+        if match.group(1) is not None or new_h > 0:
+            return f"{new_h:02d}:{new_m:02d}:{new_s:02d}.{new_ms:03d}"
+        else:
+            return f"{new_m:02d}:{new_s:02d}.{new_ms:03d}"
+
+    time_pat = re.compile(r'(?:(\d{2,}):)?(\d{2}):(\d{2})\.(\d{3})')
+
+    def replace_line(line):
+        if '-->' in line:
+            parts = line.split('-->')
+            left = time_pat.sub(shift_match, parts[0])
+            right = time_pat.sub(shift_match, parts[1])
+            return left + '-->' + right
+        return line
+
+    lines = vtt_text.splitlines()
+    return '\n'.join(replace_line(l) for l in lines)
+
+def convert_srt_to_vtt(text):
+    """Normalizes SRT format text to standard WebVTT format"""
+    if not text:
+        return ""
+    normalized = text.replace('\r\n', '\n').replace('\r', '\n').strip()
+    if normalized.startswith("WEBVTT"):
+        return normalized
+    # Replace comma in timestamps with dot (00:01:23,456 -> 00:01:23.456)
+    normalized = re.sub(r'(\d{2}:\d{2}:\d{2}),(\d{3})', r'\1.\2', normalized)
+    return "WEBVTT\n\n" + normalized
+
 def get_fallback_anime_ids(anime_id):
     """
     Bidirectional AniList ID <-> MyAnimeList ID resolver using AniList GraphQL API.

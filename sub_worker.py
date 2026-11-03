@@ -22,7 +22,10 @@ from dotenv import load_dotenv
 from sub_engine import (
     fetch_megaplay_english_sub,
     process_and_translate_vtt,
-    upload_sub_to_github_release
+    upload_sub_to_github_release,
+    adjust_vtt_timing,
+    convert_srt_to_vtt,
+    has_sinhala_characters
 )
 
 load_dotenv()
@@ -90,34 +93,64 @@ def main():
 
     db = init_firebase()
 
-    # 1. Fetch English Subtitle from MegaPlay (AniList -> MAL -> Anikoto fallback)
-    print(f"📥 Fetching English Subtitle from MegaPlay...", flush=True)
-    eng_vtt, err = fetch_megaplay_english_sub(anime_id, ep_num, title=anime_title)
-    if err or not eng_vtt:
-        print(f"⚠️ Failed fetching English sub: {err}", flush=True)
-        # Notify RTDB of failure
-        rtdb.reference(f"megaplay_sub_jobs/completed/{job_id}").set({
-            "status": "failed",
-            "error": err or "Subtitle not found",
-            "anime_id": anime_id,
-            "ep_num": ep_num,
-            "timestamp": time.time()
-        })
-        sys.exit(0)
+    # 1. Fetch Subtitle: Either custom URL or from MegaPlay
+    custom_sub_url = payload.get("custom_sub_url")
+    delay_sec = float(payload.get("delay_sec", 0.0) or 0.0)
 
-    # 2. Translate to Sinhala
-    print(f"🌐 Translating English WebVTT to Spoken Sinhala...", flush=True)
-    sinhala_vtt = process_and_translate_vtt(eng_vtt, max_threads=15)
-    if not sinhala_vtt:
-        print(f"⚠️ Translation returned empty content", flush=True)
-        rtdb.reference(f"megaplay_sub_jobs/completed/{job_id}").set({
-            "status": "failed",
-            "error": "Translation failed",
-            "anime_id": anime_id,
-            "ep_num": ep_num,
-            "timestamp": time.time()
-        })
-        sys.exit(1)
+    raw_sub_text = None
+
+    if custom_sub_url:
+        print(f"📥 Downloading Custom Subtitle from: {custom_sub_url}...", flush=True)
+        try:
+            resp = requests.get(custom_sub_url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+            if resp.status_code == 200:
+                raw_sub_text = resp.content.decode("utf-8", errors="replace")
+                raw_sub_text = convert_srt_to_vtt(raw_sub_text)
+                print(f"✅ Successfully downloaded custom subtitle ({len(raw_sub_text)} bytes)", flush=True)
+            else:
+                print(f"❌ Failed to download custom sub: HTTP {resp.status_code}", flush=True)
+        except Exception as ce:
+            print(f"❌ Custom sub download exception: {ce}", flush=True)
+
+    if not raw_sub_text:
+        # Fallback to MegaPlay English sub
+        print(f"📥 Fetching English Subtitle from MegaPlay...", flush=True)
+        eng_vtt, err = fetch_megaplay_english_sub(anime_id, ep_num, title=anime_title)
+        if err or not eng_vtt:
+            print(f"⚠️ Failed fetching English sub: {err}", flush=True)
+            # Notify RTDB of failure
+            rtdb.reference(f"megaplay_sub_jobs/completed/{job_id}").set({
+                "status": "failed",
+                "error": err or "Subtitle not found",
+                "anime_id": anime_id,
+                "ep_num": ep_num,
+                "timestamp": time.time()
+            })
+            sys.exit(0)
+        raw_sub_text = eng_vtt
+
+    # 2. Check if text already has Sinhala characters or needs translation
+    if has_sinhala_characters(raw_sub_text):
+        print(f"ℹ️ Subtitle is already in Sinhala. Skipping translation.", flush=True)
+        sinhala_vtt = raw_sub_text
+    else:
+        print(f"🌐 Translating English WebVTT to Spoken Sinhala...", flush=True)
+        sinhala_vtt = process_and_translate_vtt(raw_sub_text, max_threads=15)
+        if not sinhala_vtt:
+            print(f"⚠️ Translation returned empty content", flush=True)
+            rtdb.reference(f"megaplay_sub_jobs/completed/{job_id}").set({
+                "status": "failed",
+                "error": "Translation failed",
+                "anime_id": anime_id,
+                "ep_num": ep_num,
+                "timestamp": time.time()
+            })
+            sys.exit(1)
+
+    # 2.5 Apply timing delay shift if requested
+    if abs(delay_sec) > 0.001:
+        print(f"⏱️ Applying timing delay adjustment of {delay_sec:+.3f}s to subtitle cues...", flush=True)
+        sinhala_vtt = adjust_vtt_timing(sinhala_vtt, delay_sec)
 
     # 3. Upload to GitHub Releases
     anime_title = payload.get("anime_title") or payload.get("title", "")
