@@ -104,6 +104,16 @@ def main():
         print(f"📥 Downloading Custom Subtitle from: {custom_sub_url}...", flush=True)
         try:
             resp = requests.get(custom_sub_url, timeout=45, headers={"User-Agent": "Mozilla/5.0"})
+            
+            # Auto-resolve tmpfiles.org landing page to direct download link if needed
+            if resp.status_code == 200 and ("<!DOCTYPE" in resp.text[:200] or "<html" in resp.text[:200].lower()) and "tmpfiles.org" in custom_sub_url:
+                import re as re_mod
+                dl_match = re_mod.search(r'href=[\x27\x22](https?://[^\x27\x22]*tmpfiles\.org/dl/[^\x27\x22]+)[\x27\x22]', resp.text)
+                if dl_match:
+                    resolved_dl = dl_match.group(1)
+                    print(f"🔗 Resolved tmpfiles landing page to direct download URL: {resolved_dl}", flush=True)
+                    resp = requests.get(resolved_dl, timeout=45, headers={"User-Agent": "Mozilla/5.0"})
+
             if resp.status_code == 200:
                 # Check if downloaded content is a ZIP archive
                 import io, zipfile
