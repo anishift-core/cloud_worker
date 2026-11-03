@@ -91,13 +91,73 @@ def adjust_vtt_timing(vtt_text, shift_sec):
     lines = vtt_text.splitlines()
     return '\n'.join(replace_line(l) for l in lines)
 
+def convert_ass_to_vtt(text):
+    """Converts Advanced SubStation Alpha (.ass / .ssa) subtitle text to standard WebVTT format."""
+    if not text:
+        return ""
+    lines = text.replace('\r\n', '\n').replace('\r', '\n').split('\n')
+    events_found = False
+    format_indices = {}
+    cues = []
+    
+    for line in lines:
+        line_clean = line.strip()
+        if not line_clean:
+            continue
+        if line_clean.lower() == '[events]':
+            events_found = True
+            continue
+        if line_clean.startswith('[') and events_found:
+            break
+        if events_found and line_clean.lower().startswith('format:'):
+            parts = [p.strip().lower() for p in line_clean[7:].split(',')]
+            format_indices = {name: idx for idx, name in enumerate(parts)}
+            continue
+        if events_found and line_clean.lower().startswith('dialogue:'):
+            raw_data = line_clean[9:].split(',', len(format_indices) - 1) if format_indices else line_clean[9:].split(',', 9)
+            start_idx = format_indices.get('start', 1)
+            end_idx = format_indices.get('end', 2)
+            text_idx = format_indices.get('text', len(raw_data) - 1)
+            
+            if len(raw_data) > max(start_idx, end_idx, text_idx):
+                start = raw_data[start_idx].strip()
+                end = raw_data[end_idx].strip()
+                dialogue = raw_data[text_idx]
+                
+                # Strip ASS formatting tags {\an8}, {\b1}, {\c&H...&}, etc.
+                dialogue = re.sub(r'\{[^\}]*\}', '', dialogue)
+                dialogue = dialogue.replace('\\N', '\n').replace('\\n', '\n').replace('\\h', ' ')
+                dialogue = dialogue.strip()
+                
+                if not dialogue:
+                    continue
+                
+                # Format start & end timestamp into WebVTT hh:mm:ss.mmm
+                def fmt_time(t):
+                    pts = t.split(':')
+                    if len(pts) == 3:
+                        h = pts[0].zfill(2)
+                        m = pts[1].zfill(2)
+                        sec_pts = pts[2].split('.')
+                        s = sec_pts[0].zfill(2)
+                        ms = sec_pts[1].ljust(3, '0')[:3] if len(sec_pts) > 1 else '000'
+                        return f"{h}:{m}:{s}.{ms}"
+                    return t
+                
+                cues.append(f"{fmt_time(start)} --> {fmt_time(end)}\n{dialogue}")
+                
+    return "WEBVTT\n\n" + "\n\n".join(cues)
+
 def convert_srt_to_vtt(text):
-    """Normalizes SRT format text to standard WebVTT format"""
+    """Normalizes SRT / ASS format text to standard WebVTT format"""
     if not text:
         return ""
     normalized = text.replace('\r\n', '\n').replace('\r', '\n').strip()
     if normalized.startswith("WEBVTT"):
         return normalized
+    # Detect ASS / SSA subtitles
+    if "[Script Info]" in normalized or "[Events]" in normalized or "Dialogue:" in normalized:
+        return convert_ass_to_vtt(normalized)
     # Replace comma in timestamps with dot (00:01:23,456 -> 00:01:23.456)
     normalized = re.sub(r'(\d{2}:\d{2}:\d{2}),(\d{3})', r'\1.\2', normalized)
     return "WEBVTT\n\n" + normalized

@@ -103,7 +103,17 @@ def main():
     if custom_sub_url:
         print(f"📥 Downloading Custom Subtitle from: {custom_sub_url}...", flush=True)
         try:
-            resp = requests.get(custom_sub_url, timeout=45, headers={"User-Agent": "Mozilla/5.0"})
+            import urllib.parse
+            parsed_u = urllib.parse.urlparse(custom_sub_url)
+            domain = parsed_u.netloc.lower()
+            base_domain = '.'.join(domain.split('.')[-2:]) if '.' in domain else domain
+            req_headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": f"{parsed_u.scheme}://{base_domain}/"
+            }
+            resp = requests.get(custom_sub_url, timeout=45, headers=req_headers)
             
             # Auto-resolve tmpfiles.org landing page to direct download link if needed
             if resp.status_code == 200 and ("<!DOCTYPE" in resp.text[:200] or "<html" in resp.text[:200].lower()) and "tmpfiles.org" in custom_sub_url:
@@ -112,7 +122,7 @@ def main():
                 if dl_match:
                     resolved_dl = dl_match.group(1)
                     print(f"🔗 Resolved tmpfiles landing page to direct download URL: {resolved_dl}", flush=True)
-                    resp = requests.get(resolved_dl, timeout=45, headers={"User-Agent": "Mozilla/5.0"})
+                    resp = requests.get(resolved_dl, timeout=45, headers=req_headers)
 
             if resp.status_code == 200:
                 # Check if downloaded content is a ZIP archive
