@@ -25,6 +25,7 @@ from sub_engine import (
     upload_sub_to_github_release,
     adjust_vtt_timing,
     convert_srt_to_vtt,
+    extract_episode_number_from_filename,
     has_sinhala_characters
 )
 
@@ -102,11 +103,43 @@ def main():
     if custom_sub_url:
         print(f"📥 Downloading Custom Subtitle from: {custom_sub_url}...", flush=True)
         try:
-            resp = requests.get(custom_sub_url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+            resp = requests.get(custom_sub_url, timeout=45, headers={"User-Agent": "Mozilla/5.0"})
             if resp.status_code == 200:
-                raw_sub_text = resp.content.decode("utf-8", errors="replace")
-                raw_sub_text = convert_srt_to_vtt(raw_sub_text)
-                print(f"✅ Successfully downloaded custom subtitle ({len(raw_sub_text)} bytes)", flush=True)
+                # Check if downloaded content is a ZIP archive
+                import io, zipfile
+                content_bytes = resp.content
+                is_zip = False
+                try:
+                    zip_buf = io.BytesIO(content_bytes)
+                    if zipfile.is_zipfile(zip_buf):
+                        is_zip = True
+                except Exception:
+                    is_zip = False
+
+                if is_zip:
+                    print(f"📦 Custom URL is a ZIP archive! Extracting subtitle for Episode {ep_num}...", flush=True)
+                    with zipfile.ZipFile(zip_buf, "r") as zf:
+                        found_vtt = None
+                        fallback_vtt = None
+                        for fname in zf.namelist():
+                            if fname.endswith("/") or "__MACOSX" in fname:
+                                continue
+                            fl = fname.lower()
+                            if fl.endswith(".vtt") or fl.endswith(".srt") or fl.endswith(".ass") or fl.endswith(".sub"):
+                                extracted_ep = extract_episode_number_from_filename(fname)
+                                raw_txt = zf.read(fname).decode("utf-8", errors="replace")
+                                vtt_txt = convert_srt_to_vtt(raw_txt)
+                                if extracted_ep == ep_num:
+                                    found_vtt = vtt_txt
+                                    print(f"✅ Found exact match in ZIP for Ep {ep_num}: {fname}", flush=True)
+                                    break
+                                elif fallback_vtt is None:
+                                    fallback_vtt = vtt_txt
+                        raw_sub_text = found_vtt or fallback_vtt
+                else:
+                    raw_sub_text = content_bytes.decode("utf-8", errors="replace")
+                    raw_sub_text = convert_srt_to_vtt(raw_sub_text)
+                    print(f"✅ Successfully downloaded custom subtitle ({len(raw_sub_text)} bytes)", flush=True)
             else:
                 print(f"❌ Failed to download custom sub: HTTP {resp.status_code}", flush=True)
         except Exception as ce:

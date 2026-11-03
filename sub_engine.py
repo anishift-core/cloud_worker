@@ -102,6 +102,44 @@ def convert_srt_to_vtt(text):
     normalized = re.sub(r'(\d{2}:\d{2}:\d{2}),(\d{3})', r'\1.\2', normalized)
     return "WEBVTT\n\n" + normalized
 
+def extract_episode_number_from_filename(filename):
+    """
+    Intelligently extracts the episode number from subtitle filenames.
+    Examples:
+    - 'Bleach - 01 [1080p].vtt' -> 1
+    - '[SubsPlease] One Piece - 1089 (1080p).srt' -> 1089
+    - 'Demon Slayer S03E05.srt' -> 5
+    - 'Attack on Titan Episode 12 Sinhala.vtt' -> 12
+    - 'ep_03_sinhala.vtt' -> 3
+    - '01.vtt' -> 1
+    """
+    if not filename:
+        return None
+
+    base = re.sub(r'\.[a-zA-Z0-9]+$', '', str(filename))
+    clean = re.sub(r'\[[^\]]*\]|\([^\)]*\)', ' ', base).strip()
+
+    m = re.search(r'[sS]\d+[\s._-]*[eE](\d+)', clean)
+    if m:
+        return int(m.group(1))
+
+    m = re.search(r'(?:ep|ep\.|episode|e)[\s._-]*(\d+)', clean, re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+
+    m = re.search(r'[-_]\s*(\d+)\s*(?:$|[-_])', clean)
+    if m:
+        return int(m.group(1))
+
+    nums = re.findall(r'\b\d+\b', clean)
+    if nums:
+        filtered = [int(n) for n in nums if int(n) not in (1080, 720, 480, 360, 2160) and not (1950 <= int(n) <= 2030 and len(n) == 4)]
+        if filtered:
+            return filtered[-1]
+        return int(nums[-1])
+
+    return None
+
 def get_fallback_anime_ids(anime_id):
     """
     Bidirectional AniList ID <-> MyAnimeList ID resolver using AniList GraphQL API.
