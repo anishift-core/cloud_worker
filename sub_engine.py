@@ -18,6 +18,12 @@ import base64
 import requests
 import concurrent.futures
 
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 try:
     import chardet
 except ImportError:
@@ -497,23 +503,87 @@ def fetch_megaplay_english_sub(anime_id, ep_num, title=None):
     if not eng_track_url:
         return None, "No subtitle track available on MegaPlay"
 
-    sub_resp = requests.get(eng_track_url, headers=headers, timeout=20)
-    if sub_resp.status_code != 200:
-        return None, f"Failed downloading VTT file: {sub_resp.status_code}"
+    def download_vtt_with_mirror_failover(target_url):
+        """
+        Downloads a MegaPlay .vtt subtitle with automatic CDN domain healing.
+        Polls https://megaplay.buzz/lib/check_domain.json to discover MegaPlay's live
+        healthy fallback mirror (e.g. xdw5v.qeltrix.top) and bypasses dead hosts like 4gmkc.mysubsplay.com.
+        """
+        import urllib.parse
+        mirrors = ["https://xdw5v.qeltrix.top", "https://fetch.nexabloom.top"]
+        failed_hosts = {"4gmkc.mysubsplay.com"}
+
+        try:
+            cd_res = requests.get(
+                "https://megaplay.buzz/lib/check_domain.json",
+                headers={"Referer": "https://megaplay.buzz/", "User-Agent": headers["User-Agent"]},
+                timeout=5
+            )
+            if cd_res.status_code == 200:
+                cd_data = cd_res.json()
+                fb = (cd_data.get("fallback") or "").strip().rstrip("/")
+                if fb:
+                    fb_origin = fb if fb.startswith("http") else f"https://{fb}"
+                    if fb_origin not in mirrors:
+                        mirrors.insert(0, fb_origin)
+                for fh in (cd_data.get("failed") or []):
+                    if fh:
+                        failed_hosts.add(str(fh).strip().lower())
+        except Exception:
+            pass
+
+        candidate_sub_urls = []
+        try:
+            parsed = urllib.parse.urlparse(target_url)
+            host = (parsed.hostname or "").lower()
+            path_and_query = parsed.path + (f"?{parsed.query}" if parsed.query else "")
+
+            # If original host is known dead, prioritize healthy mirrors first
+            if host in failed_hosts and parsed.path.startswith("/anime/"):
+                for m in mirrors:
+                    u = f"{m}{path_and_query}"
+                    if u not in candidate_sub_urls:
+                        candidate_sub_urls.append(u)
+                candidate_sub_urls.append(target_url)
+            else:
+                candidate_sub_urls.append(target_url)
+                if parsed.path.startswith("/anime/"):
+                    for m in mirrors:
+                        u = f"{m}{path_and_query}"
+                        if u not in candidate_sub_urls:
+                            candidate_sub_urls.append(u)
+        except Exception:
+            candidate_sub_urls = [target_url]
+
+        last_status = "Connection Error"
+        for cand_u in candidate_sub_urls:
+            try:
+                r = requests.get(cand_u, headers=headers, timeout=15)
+                last_status = r.status_code
+                if r.status_code == 200 and ("WEBVTT" in r.text or "-->" in r.text):
+                    if cand_u != target_url:
+                        print(f"🛡️ [Auto-Heal] Downloaded subtitle via healthy mirror: {cand_u}", flush=True)
+                    return r.text, None
+            except Exception as ex:
+                last_status = str(ex)
+        return None, f"Failed downloading VTT file across all mirrors (last status: {last_status})"
+
+    vtt_text, dl_err = download_vtt_with_mirror_failover(eng_track_url)
+    if not vtt_text:
+        return None, dl_err
 
     # Safety fallback: if multiple English tracks exist and the chosen track has very few cues (< 35 lines, e.g. unlabelled forced track),
     # check the next best English track to see if it has the full dialogue!
-    vtt_text = sub_resp.text
     if len(scored_tracks) > 1 and vtt_text.count("-->") < 35:
         for alt_score, alt_track in scored_tracks[1:]:
             alt_url = alt_track.get("file")
             if not alt_url or alt_url == eng_track_url:
                 continue
             try:
-                alt_resp = requests.get(alt_url, headers=headers, timeout=20)
-                if alt_resp.status_code == 200 and alt_resp.text.count("-->") > vtt_text.count("-->") * 2:
-                    print(f"🔄 Switched from short track '{selected_label}' ({vtt_text.count('-->')} cues) to full track '{alt_track.get('label')}' ({alt_resp.text.count('-->')} cues)!", flush=True)
-                    vtt_text = alt_resp.text
+                alt_text, _ = download_vtt_with_mirror_failover(alt_url)
+                if alt_text and alt_text.count("-->") > vtt_text.count("-->") * 2:
+                    print(f"🔄 Switched from short track '{selected_label}' ({vtt_text.count('-->')} cues) to full track '{alt_track.get('label')}' ({alt_text.count('-->')} cues)!", flush=True)
+                    vtt_text = alt_text
                     break
             except Exception:
                 pass
