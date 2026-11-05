@@ -707,7 +707,47 @@ def sanitize_filename_slug(name):
         return ""
     # Replace non-alphanumeric with hyphen
     slug = re.sub(r'[^a-zA-Z0-9]+', '-', str(name).strip()).strip('-').lower()
-    return slug[:50]
+    # Truncate THEN strip again, otherwise a cut can leave a trailing '-' (invalid/ugly tag)
+    return slug[:50].strip('-')
+
+def get_default_branch(github_repo, headers):
+    """Returns the repo's real default branch (main/master/etc). Falls back to None."""
+    try:
+        r = requests.get(f"https://api.github.com/repos/{github_repo}", headers=headers, timeout=10)
+        if r.status_code == 200:
+            return r.json().get("default_branch") or None
+    except Exception:
+        pass
+    return None
+
+def repo_has_commits(github_repo, headers):
+    """True if the repo has at least one commit (GitHub cannot create tags on an empty repo)."""
+    try:
+        r = requests.get(f"https://api.github.com/repos/{github_repo}/commits?per_page=1", headers=headers, timeout=10)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+def ensure_repo_initialized(github_repo, headers):
+    """Makes sure the repo has a commit + a valid default branch. Returns the branch name."""
+    branch = get_default_branch(github_repo, headers)
+    if repo_has_commits(github_repo, headers):
+        return branch
+
+    print(f"🌱 Repo '{github_repo}' has no commits. Creating initial README commit...", flush=True)
+    payload = {
+        "message": "Initial commit - AniShift Sub Vault",
+        "content": "IyBBbmlTaGlmdCBTdWJ0aXRsZSBWYXVsdA==",  # "# AniShift Subtitle Vault"
+    }
+    # Don't force a branch name: let GitHub use the repo default
+    if branch:
+        payload["branch"] = branch
+    pr = requests.put(f"https://api.github.com/repos/{github_repo}/contents/README.md",
+                      headers=headers, json=payload, timeout=15)
+    if pr.status_code not in (200, 201):
+        print(f"⚠️ README init failed: {pr.status_code} {pr.text[:300]}", flush=True)
+    time.sleep(2)
+    return get_default_branch(github_repo, headers) or branch
 
 def ensure_github_repository(github_repo, github_token):
     """Ensures GitHub repository exists. If not, automatically creates it under user account."""
@@ -771,6 +811,9 @@ def upload_sub_to_github_release(vtt_text, anime_id, ep_num, github_token, githu
         "User-Agent": "MegaPlaySubBot/1.0"
     }
 
+    # Detect real default branch (hardcoded "main" caused "tag_name is not a valid tag" on master/empty repos)
+    default_branch = ensure_repo_initialized(github_repo, headers)
+
     anime_slug = sanitize_filename_slug(anime_title) or f"ani-{anime_id}"
     ep_int = int(ep_num)
     is_movie = (category == "movie" or ep_int == 1 and "movie" in anime_slug)
@@ -779,6 +822,9 @@ def upload_sub_to_github_release(vtt_text, anime_id, ep_num, github_token, githu
     chunk_idx = ((ep_int - 1) // 500) + 1 if not is_movie else 1
     part_suffix = f"-p{chunk_idx}" if chunk_idx > 1 else ""
     tag_name = f"sub-{anime_slug}{part_suffix}"
+    # Final safety net: tag must only contain safe chars and not end with '-' / '.'
+    tag_name = re.sub(r'[^A-Za-z0-9._-]+', '-', tag_name).strip('-.') or f"sub-ani-{anime_id}"
+    print(f"🏷️ Release tag: {tag_name!r} | branch: {default_branch!r}", flush=True)
 
     rel_url = f"https://api.github.com/repos/{github_repo}/releases/tags/{tag_name}"
     resp = requests.get(rel_url, headers=headers, timeout=15)
@@ -799,12 +845,13 @@ def upload_sub_to_github_release(vtt_text, anime_id, ep_num, github_token, githu
 
         release_payload = {
             "tag_name": tag_name,
-            "target_commitish": "main",
             "name": release_display_name,
             "body": f"Automated WebVTT Sinhala subtitles for {anime_title or anime_id} (Batch {chunk_idx})",
             "draft": False,
             "prerelease": False
         }
+        if default_branch:
+            release_payload["target_commitish"] = default_branch
 
         c_resp = requests.post(create_url, headers=headers, json=release_payload, timeout=15)
 
@@ -829,15 +876,17 @@ def upload_sub_to_github_release(vtt_text, anime_id, ep_num, github_token, githu
                                 c_resp._content = json.dumps(r_item).encode('utf-8')
                                 break
             else:
-                print(f"🌱 GitHub Release validation failed on '{github_repo}'. Checking/committing README.md...", flush=True)
-                readme_payload = {
-                    "message": "Initial commit - AniShift Sub Vault",
-                    "content": "IyBBbmlTaGlmdCBTdWJ0aXRsZSBWYXVsdA==", # Base64 for "# AniShift Subtitle Vault"
-                    "branch": "main"
-                }
-                requests.put(f"https://api.github.com/repos/{github_repo}/contents/README.md", headers=headers, json=readme_payload, timeout=15)
+                print(f"🌱 GitHub Release validation failed on '{github_repo}': {resp_txt[:300]}", flush=True)
+                # Re-check branch/commits, then retry once WITHOUT target_commitish (GitHub uses default branch)
+                default_branch = ensure_repo_initialized(github_repo, headers)
                 time.sleep(2)
+                release_payload.pop("target_commitish", None)
+                if default_branch:
+                    release_payload["target_commitish"] = default_branch
                 c_resp = requests.post(create_url, headers=headers, json=release_payload, timeout=15)
+                if c_resp.status_code == 422 and "already_exists" not in c_resp.text:
+                    release_payload.pop("target_commitish", None)
+                    c_resp = requests.post(create_url, headers=headers, json=release_payload, timeout=15)
 
         if c_resp.status_code in (200, 201):
             rel_data = c_resp.json()
@@ -903,4 +952,3 @@ def upload_sub_to_github_release(vtt_text, anime_id, ep_num, github_token, githu
         return f"https://github.com/{github_repo}/releases/download/{tag_name}/{asset_name}"
     else:
         raise RuntimeError(f"Failed uploading asset: {up_resp.status_code} {up_resp.text}")
-
