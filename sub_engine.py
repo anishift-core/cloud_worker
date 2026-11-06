@@ -967,37 +967,68 @@ def parse_vtt_cues(vtt_text):
 
 def translate_guaranteed_sinhala(text):
     """
-    Direct high-speed Google Chrome Translate API for Sinhala (0 auth, 0 rate limit, 100% success).
-    Preserves timing and translates to natural Sinhala.
+    High-speed universal multi-language translation pipeline:
+    1. If text is already in Sinhala -> return with Spoken Sinhala dictionary.
+    2. Any input language (Japanese, Russian, French, Spanish, German, Chinese, Arabic, etc.)
+       is detected and translated to English first (sl='auto', tl='en') for maximum quality.
+    3. English is translated to Sinhala (sl='en', tl='si').
+    4. Spoken Sinhala dictionary is applied for authentic, natural phrasing.
     """
-    if not text or not text.strip():
+    if not text or not str(text).strip():
         return ""
     
-    # Strip HTML tags like <i>, </b> for clean translation, keep clean dialogue
+    # Strip HTML/formatting tags like <i>, </b>, etc.
     clean_text = re.sub(r'<[^>]+>', '', str(text)).strip()
-    if not clean_text or not re.search(r'[a-zA-Z]', clean_text):
+    # If text contains no letters across any language (e.g. only numbers, punctuation, timestamps, music symbols)
+    if not clean_text or not re.search(r'[^\W\d_]', clean_text, re.UNICODE):
         return text
 
-    # Strategy 1: Google Chrome Translate API (clients5.google.com)
-    for attempt in range(3):
+    if has_sinhala_characters(clean_text):
+        return apply_spoken_sinhala(clean_text)
+
+    url = "https://clients5.google.com/translate_a/t"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+
+    # Step 1: Detect source language and convert to clean English (auto -> en)
+    en_text = clean_text
+    detected_lang = "en"
+    for _ in range(2):
         try:
-            url = "https://clients5.google.com/translate_a/t"
-            params = {"client": "dict-chrome-ex", "sl": "auto", "tl": "si", "q": clean_text}
-            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-            resp = requests.get(url, params=params, headers=headers, timeout=5)
+            resp = requests.get(url, params={"client": "dict-chrome-ex", "sl": "auto", "tl": "en", "q": clean_text}, headers=headers, timeout=6)
             if resp.status_code == 200:
                 data = resp.json()
                 if isinstance(data, list) and len(data) > 0:
-                    res_text = str(data[0][0]) if isinstance(data[0], list) else str(data[0])
-                    if res_text and has_sinhala_characters(res_text):
-                        return apply_spoken_sinhala(res_text)
+                    first = data[0]
+                    if isinstance(first, list):
+                        en_text = str(first[0])
+                        if len(first) > 1 and first[1]:
+                            detected_lang = str(first[1]).lower()
+                    else:
+                        en_text = str(first)
+                    break
         except Exception:
-            time.sleep(0.5)
+            time.sleep(0.3)
 
-    # Strategy 2: GoogleTranslator fallback
+    if detected_lang == "si" or has_sinhala_characters(en_text):
+        return apply_spoken_sinhala(en_text)
+
+    # Step 2: Translate English text to Sinhala (en -> si)
+    for _ in range(3):
+        try:
+            resp = requests.get(url, params={"client": "dict-chrome-ex", "sl": "en", "tl": "si", "q": en_text}, headers=headers, timeout=6)
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, list) and len(data) > 0:
+                    si_text = str(data[0][0]) if isinstance(data[0], list) else str(data[0])
+                    if si_text and has_sinhala_characters(si_text):
+                        return apply_spoken_sinhala(si_text)
+        except Exception:
+            time.sleep(0.3)
+
+    # Strategy 3: GoogleTranslator fallback (deep_translator)
     try:
         from deep_translator import GoogleTranslator
-        trans = GoogleTranslator(source="auto", target="si").translate(clean_text)
+        trans = GoogleTranslator(source="auto", target="si").translate(en_text or clean_text)
         if trans and has_sinhala_characters(trans):
             return apply_spoken_sinhala(trans)
     except Exception:
