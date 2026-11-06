@@ -378,16 +378,17 @@ def get_fallback_anime_ids(anime_id):
             if ids["titles"]:
                 ids["title"] = ids["titles"][0]
 
-            # Extract TV PREQUEL chain (up to 2 levels for Part 2 / Part 3 split cours)
+            # Extract TV PREQUEL chain (up to 2 levels for Part 2 / Part 3 split cours, including across intermediate Recap/Special entries)
             edges = (media.get("relations") or {}).get("edges") or []
             for edge in edges:
                 if edge.get("relationType") == "PREQUEL":
                     pnode = edge.get("node") or {}
-                    if pnode.get("type") == "ANIME" and pnode.get("format") == "TV" and (pnode.get("episodes") or 0) > 0:
+                    p_is_tv = (pnode.get("type") == "ANIME" and pnode.get("format") == "TV" and (pnode.get("episodes") or 0) > 0)
+                    p_eps = int(pnode["episodes"]) if p_is_tv else 0
+                    if p_is_tv:
                         pt_obj = pnode.get("title") or {}
                         pt_list = [pt_obj.get("english"), pt_obj.get("romaji"), pt_obj.get("userPreferred")]
                         p_titles = [t.strip() for t in pt_list if t and str(t).strip()]
-                        p_eps = int(pnode["episodes"])
                         ids["prequels"].append({
                             "anilist_id": str(pnode["id"]) if pnode.get("id") else None,
                             "mal_id": str(pnode["idMal"]) if pnode.get("idMal") else None,
@@ -396,26 +397,49 @@ def get_fallback_anime_ids(anime_id):
                             "title": p_titles[0] if p_titles else None,
                             "titles": p_titles
                         })
-                        # Check 2nd-level prequel (e.g. Part 3 -> Part 2 -> Part 1)
-                        sub_edges = (pnode.get("relations") or {}).get("edges") or []
-                        for sedge in sub_edges:
-                            if sedge.get("relationType") == "PREQUEL":
-                                spnode = sedge.get("node") or {}
-                                if spnode.get("type") == "ANIME" and spnode.get("format") == "TV" and (spnode.get("episodes") or 0) > 0:
-                                    spt_obj = spnode.get("title") or {}
-                                    spt_list = [spt_obj.get("english"), spt_obj.get("romaji"), spt_obj.get("userPreferred")]
-                                    sp_titles = [t.strip() for t in spt_list if t and str(t).strip()]
-                                    sp_eps = int(spnode["episodes"])
-                                    ids["prequels"].append({
-                                        "anilist_id": str(spnode["id"]) if spnode.get("id") else None,
-                                        "mal_id": str(spnode["idMal"]) if spnode.get("idMal") else None,
-                                        "episodes_offset": p_eps + sp_eps,
-                                        "season_year": spnode.get("seasonYear"),
-                                        "title": sp_titles[0] if sp_titles else None,
-                                        "titles": sp_titles
-                                    })
+                    # Check 2nd-level prequel (e.g. Part 3 -> Part 2 -> Part 1, or Part 2 -> Recap Special -> Part 1)
+                    sub_edges = (pnode.get("relations") or {}).get("edges") or []
+                    for sedge in sub_edges:
+                        if sedge.get("relationType") == "PREQUEL":
+                            spnode = sedge.get("node") or {}
+                            if spnode.get("type") == "ANIME" and spnode.get("format") == "TV" and (spnode.get("episodes") or 0) > 0:
+                                spt_obj = spnode.get("title") or {}
+                                spt_list = [spt_obj.get("english"), spt_obj.get("romaji"), spt_obj.get("userPreferred")]
+                                sp_titles = [t.strip() for t in spt_list if t and str(t).strip()]
+                                sp_eps = int(spnode["episodes"])
+                                ids["prequels"].append({
+                                    "anilist_id": str(spnode["id"]) if spnode.get("id") else None,
+                                    "mal_id": str(spnode["idMal"]) if spnode.get("idMal") else None,
+                                    "episodes_offset": p_eps + sp_eps,
+                                    "season_year": spnode.get("seasonYear"),
+                                    "title": sp_titles[0] if sp_titles else None,
+                                    "titles": sp_titles
+                                })
     except Exception:
         pass
+
+    # Fallback / Enrich via api.ani.zip (provides TVDB episode mappings & base season title even if AniList GraphQL is rate-limited)
+    try:
+        az_id = ids.get("anilist_id") or anime_id
+        az_res = requests.get(f"https://api.ani.zip/mappings?anilist_id={az_id}", headers={"User-Agent": "Mozilla/5.0"}, timeout=6)
+        if az_res.status_code == 200:
+            az_data = az_res.json()
+            az_mal = (az_data.get("mappings") or {}).get("mal_id")
+            if az_mal and not ids.get("mal_id"):
+                ids["mal_id"] = str(az_mal)
+            az_titles_obj = az_data.get("titles") or {}
+            raw_en = az_titles_obj.get("en") or az_titles_obj.get("x-jat") or ""
+            clean_base = re.sub(r'\s*\(\d{4}\)\s*$', '', str(raw_en)).strip()
+            if clean_base:
+                ids["base_season_title"] = clean_base
+                if not ids.get("title"):
+                    ids["title"] = clean_base
+                if clean_base not in ids["titles"]:
+                    ids["titles"].append(clean_base)
+            ids["anizip_episodes"] = az_data.get("episodes") or {}
+    except Exception:
+        pass
+
     return ids
 
 def _parse_anikoto_search_items(html):
@@ -570,6 +594,83 @@ def resolve_megaplay_via_anikoto(title, ep_num, anime_id=None, id_map=None):
                 if did:
                     print(f"🎬 [Anikoto Prequel Continuation] Resolved '{target_titles[0]}' EP {ep_num} via Prequel '{preq_titles[0]}' EP {combined_ep} -> data-id {did}", flush=True)
                     return did
+
+        # 3. Split-Cour / Base-Season Continuation match via ani.zip TVDB mapping & embed_id jump detection
+        base_titles = []
+        if id_map.get("base_season_title"):
+            base_titles.append(id_map["base_season_title"])
+        for tt in target_titles:
+            stripped = re.sub(r'\b(?:part|cour)\s*\d+\b', '', str(tt), flags=re.IGNORECASE)
+            stripped = re.sub(r'\b\d+(?:st|nd|rd|th)\s*(?:part|cour)\b', '', stripped, flags=re.IGNORECASE)
+            stripped = re.sub(r'\s*\(\d{4}\)\s*', ' ', stripped)
+            stripped = re.sub(r'[:\-–—\s]+$', '', stripped)
+            stripped = re.sub(r'\s+', ' ', stripped).strip()
+            if stripped and stripped.lower() != str(tt).strip().lower() and stripped not in base_titles:
+                base_titles.append(stripped)
+
+        if base_titles:
+            base_cands = list(all_cands)
+            seen_bh = {bc["href"] for bc in base_cands}
+            for ec in search_anikoto_candidates(base_titles[0]):
+                if ec["href"] not in seen_bh:
+                    seen_bh.add(ec["href"])
+                    base_cands.append(ec)
+
+            base_scored = []
+            for c in base_cands:
+                sc = _score_anikoto_candidate(c["en_title"], c["jp_title"], c["year"], base_titles, None)
+                if sc > 0:
+                    base_scored.append((sc, c))
+            base_scored.sort(key=lambda x: x[0], reverse=True)
+
+            az_ep_info = (id_map.get("anizip_episodes") or {}).get(str(ep_num)) or {}
+            az_ep_title = str((az_ep_info.get("title") or {}).get("en") or "").strip().lower()
+            az_season_ep_num = az_ep_info.get("episodeNumber")
+
+            for sc, c in base_scored:
+                wr = s.get(c["href"], timeout=10)
+                dids = re.findall(r'data-id=[\'"](\d+)[\'"]', wr.text)
+                if not dids:
+                    continue
+                series_id = dids[0]
+                api_res = s.get(f"https://anikotoapi.site/series/{series_id}", timeout=10)
+                if api_res.status_code != 200:
+                    continue
+                api_json = api_res.json().get("data", {})
+                episodes = api_json.get("episodes") or []
+                if not episodes:
+                    continue
+
+                matched_ep = None
+                if az_ep_title:
+                    matched_ep = next((e for e in episodes if str(e.get("title") or "").strip().lower() == az_ep_title), None)
+                if not matched_ep and az_season_ep_num and int(az_season_ep_num) > int(ep_num):
+                    matched_ep = next((e for e in episodes if int(e.get("number", 0)) == int(az_season_ep_num)), None)
+                if not matched_ep and len(episodes) > int(ep_num):
+                    detected_offset = 0
+                    for idx in range(10, len(episodes)):
+                        try:
+                            prev_emb = int(episodes[idx - 1].get("episode_embed_id") or 0)
+                            curr_emb = int(episodes[idx].get("episode_embed_id") or 0)
+                            if prev_emb > 0 and curr_emb - prev_emb > 50:
+                                detected_offset = int(episodes[idx - 1].get("number") or idx)
+                                break
+                        except Exception:
+                            pass
+                    if not detected_offset and len(episodes) >= 12 + int(ep_num):
+                        detected_offset = 12
+                    if detected_offset > 0:
+                        target_comb_num = detected_offset + int(ep_num)
+                        matched_ep = next((e for e in episodes if int(e.get("number", 0)) == target_comb_num), None)
+
+                if matched_ep:
+                    embed_id = matched_ep.get("episode_embed_id")
+                    embed_url = (matched_ep.get("embed_url") or {}).get("sub") or f"https://megaplay.buzz/stream/s-2/{embed_id}/sub"
+                    mr = s.get(embed_url, headers={"Referer": "https://megaplay.buzz/"}, timeout=10)
+                    m_ids = re.findall(r'data-id=[\'"](\d+)[\'"]', mr.text)
+                    if m_ids:
+                        print(f"🎬 [Anikoto Base-Season Split-Cour] Resolved '{target_titles[0]}' EP {ep_num} -> Series {series_id} EP {matched_ep.get('number')} (data-id: {m_ids[0]})", flush=True)
+                        return m_ids[0]
 
     except Exception as e:
         print(f"⚠️ [Anikoto Fallback] Error: {e}", flush=True)
