@@ -94,13 +94,58 @@ def main():
 
     db = init_firebase()
 
-    # 1. Fetch Subtitle: Either custom URL or from MegaPlay
+    # 1. Fetch Subtitle: Either Delay Adjustment on existing sub, Custom URL, or MegaPlay
     custom_sub_url = payload.get("custom_sub_url")
     delay_sec = float(payload.get("delay_sec", 0.0) or 0.0)
+    existing_sub_url = None
+    is_delay_only = (custom_sub_url == "__DELAY_ADJUST__" or str(custom_sub_url or "").startswith("__DELAY_ADJUST__"))
 
     raw_sub_text = None
 
-    if custom_sub_url:
+    if is_delay_only:
+        print(f"⏱️ [Delay Adjust Mode] Fetching existing Sinhala subtitle URL from Firestore ({episode_path})...", flush=True)
+        try:
+            ep_snap = db.document(episode_path).get()
+            if not ep_snap.exists and episode_path.startswith("movies/"):
+                alt_path = episode_path.replace("movies/", "anime_movies/", 1)
+                ep_snap = db.document(alt_path).get()
+                if ep_snap.exists:
+                    episode_path = alt_path
+            if ep_snap.exists:
+                ep_data = ep_snap.to_dict() or {}
+                existing_sub_url = (ep_data.get("stream") or {}).get("sinhala_sub") or (ep_data.get("stream_subtitles") or {}).get("sinhala")
+                if existing_sub_url:
+                    clean_dl = existing_sub_url.split("?")[0] + f"?_cb={int(time.time())}"
+                    s_resp = requests.get(
+                        clean_dl,
+                        timeout=30,
+                        headers={
+                            "User-Agent": "Mozilla/5.0",
+                            "Cache-Control": "no-cache, no-store, must-revalidate",
+                            "Pragma": "no-cache"
+                        }
+                    )
+                    if s_resp.status_code == 200:
+                        raw_sub_text = convert_srt_to_vtt(s_resp.content.decode("utf-8-sig", errors="replace"))
+                        print(f"✅ Downloaded existing Sinhala subtitle ({len(raw_sub_text)} bytes) from {existing_sub_url}", flush=True)
+                    else:
+                        print(f"⚠️ Failed downloading existing sub from {existing_sub_url}: HTTP {s_resp.status_code}", flush=True)
+                else:
+                    print(f"⚠️ No existing Sinhala subtitle URL found in Firestore for {episode_path}", flush=True)
+        except Exception as de:
+            print(f"⚠️ Error fetching existing subtitle from Firestore: {de}", flush=True)
+
+        if not raw_sub_text:
+            rtdb.reference(f"megaplay_sub_jobs/completed/{job_id}").set({
+                "status": "failed",
+                "error": "No existing Sinhala subtitle found for delay adjustment",
+                "anime_id": anime_id,
+                "ep_num": ep_num,
+                "timestamp": time.time()
+            })
+            sys.exit(0)
+
+    elif custom_sub_url:
         print(f"📥 Downloading Custom Subtitle from: {custom_sub_url}...", flush=True)
         try:
             import urllib.parse
@@ -223,7 +268,8 @@ def main():
         github_token=GITHUB_TOKEN,
         github_repo=GITHUB_REPO,
         anime_title=anime_title,
-        category=category
+        category=category,
+        existing_sub_url=existing_sub_url
     )
     print(f"✅ Subtitle uploaded successfully: {sub_url}", flush=True)
 
