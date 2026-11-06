@@ -212,141 +212,371 @@ def extract_episode_number_from_filename(filename):
 
     return None
 
+def _parse_title_features(title):
+    if not title:
+        return {"base": set(), "season": None, "part": None, "is_final": False, "is_special": False}
+    t = str(title).lower()
+    t = re.sub(r'\b(?:season|part|cour)\s+iii\b', lambda m: m.group(0).rsplit('iii', 1)[0] + '3', t)
+    t = re.sub(r'\b(?:season|part|cour)\s+ii\b', lambda m: m.group(0).rsplit('ii', 1)[0] + '2', t)
+    t = re.sub(r'\b(?:season|part|cour)\s+iv\b', lambda m: m.group(0).rsplit('iv', 1)[0] + '4', t)
+
+    is_final = bool(re.search(r'\b(final\s+season|the\s+final|kanketsu[\s-]*hen)\b', t))
+    is_special = bool(re.search(r'\b(ova|oad|ona|special|movie|recap|chronicle)\b', t))
+
+    season = None
+    m_s = re.search(r'\bseason\s*(\d+)\b|\b(\d+)(?:st|nd|rd|th)\s*season\b|\bs(\d+)\b', t)
+    if m_s:
+        season = int(next(g for g in m_s.groups() if g is not None))
+
+    part = None
+    m_p = re.search(r'\b(?:part|cour)\s*(\d+)\b|\b(\d+)(?:st|nd|rd|th)\s*(?:part|cour)\b', t)
+    if m_p:
+        part = int(next(g for g in m_p.groups() if g is not None))
+
+    clean = re.sub(
+        r'\b(season\s*\d+|\d+(?:st|nd|rd|th)\s*season|s\d+|(?:part|cour)\s*\d+|\d+(?:st|nd|rd|th)\s*(?:part|cour)|the\s+final\s+season|final\s+season|kanketsu[\s-]*hen|the|no|of|on|in|to|a|an|and|wa|ni|ga|wo|o)\b',
+        ' ',
+        t
+    )
+    words = {w for w in re.findall(r'[a-z]{2,}', clean) if w not in {'tv', 'part', 'season', 'cour', 'final'}}
+    return {
+        "base": words,
+        "season": season,
+        "part": part,
+        "is_final": is_final,
+        "is_special": is_special
+    }
+
+def _score_anikoto_candidate(cand_en, cand_jp, cand_year, target_titles, target_year=None):
+    cand_feats = [_parse_title_features(cand_en), _parse_title_features(cand_jp)]
+    target_feats = [_parse_title_features(t) for t in (target_titles or []) if t]
+    if not target_feats:
+        return -1000
+
+    t_base = set()
+    for tf in target_feats:
+        t_base |= tf["base"]
+    t_season = next((tf["season"] for tf in target_feats if tf["season"] is not None), None)
+    t_part = next((tf["part"] for tf in target_feats if tf["part"] is not None), None)
+    t_final = any(tf["is_final"] for tf in target_feats)
+    t_special = any(tf["is_special"] for tf in target_feats)
+
+    c_base = set()
+    for cf in cand_feats:
+        c_base |= cf["base"]
+    c_season = next((cf["season"] for cf in cand_feats if cf["season"] is not None), None)
+    c_part = next((cf["part"] for cf in cand_feats if cf["part"] is not None), None)
+    c_final = any(cf["is_final"] for cf in cand_feats)
+    c_special = any(cf["is_special"] for cf in cand_feats)
+
+    if t_base and not (t_base & c_base):
+        return -1000
+    if t_special != c_special:
+        return -1000
+    if t_final != c_final:
+        return -1000
+
+    eff_t_season = t_season if t_season is not None else (None if t_final else 1)
+    eff_c_season = c_season if c_season is not None else (None if c_final else 1)
+    if eff_t_season != eff_c_season:
+        return -1000
+
+    eff_t_part = t_part if t_part is not None else 1
+    eff_c_part = c_part if c_part is not None else 1
+    if eff_t_part != eff_c_part:
+        return -1000
+
+    score = len(t_base & c_base) * 20
+    if target_year and cand_year:
+        try:
+            ty, cy = int(target_year), int(cand_year)
+            if ty == cy:
+                score += 50
+            elif abs(ty - cy) > 1:
+                score -= 40
+        except Exception:
+            pass
+    return score
+
 def get_fallback_anime_ids(anime_id):
     """
-    Bidirectional AniList ID <-> MyAnimeList ID resolver using AniList GraphQL API.
-    Resolves both directions:
-    1. If anilist_id is provided, returns corresponding MAL ID.
-    2. If MAL ID is provided, returns corresponding AniList ID.
+    Bidirectional AniList ID <-> MyAnimeList ID resolver using AniList GraphQL API,
+    including TV PREQUEL chain metadata for split-cour / Part 2 episode offset resolution.
     """
-    ids = {"anilist_id": str(anime_id), "mal_id": None}
+    ids = {
+        "anilist_id": str(anime_id) if anime_id else None,
+        "mal_id": None,
+        "title": None,
+        "titles": [],
+        "season_year": None,
+        "episodes": None,
+        "prequels": []
+    }
     if not anime_id:
         return ids
     try:
         int_id = int(str(anime_id).strip())
         headers = {"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
+        gql_fields = """
+          id
+          idMal
+          seasonYear
+          episodes
+          title { english romaji userPreferred }
+          relations {
+            edges {
+              relationType(version: 2)
+              node {
+                id
+                idMal
+                episodes
+                seasonYear
+                format
+                type
+                title { english romaji userPreferred }
+                relations {
+                  edges {
+                    relationType(version: 2)
+                    node {
+                      id
+                      idMal
+                      episodes
+                      seasonYear
+                      format
+                      type
+                      title { english romaji userPreferred }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        """
 
-        # 1. Try querying as AniList ID
-        q1 = "query ($id: Int) { Media (id: $id, type: ANIME) { id idMal } }"
-        r1 = requests.post("https://graphql.anilist.co", json={"query": q1, "variables": {"id": int_id}}, headers=headers, timeout=5)
+        media = None
+        q1 = f"query ($id: Int) {{ Media (id: $id, type: ANIME) {{ {gql_fields} }} }}"
+        r1 = requests.post("https://graphql.anilist.co", json={"query": q1, "variables": {"id": int_id}}, headers=headers, timeout=6)
         if r1.status_code == 200:
             media = r1.json().get("data", {}).get("Media")
-            if media:
-                if media.get("idMal"): ids["mal_id"] = str(media["idMal"])
-                if media.get("id"): ids["anilist_id"] = str(media["id"])
-                return ids
 
-        # 2. Try querying as MAL ID
-        q2 = "query ($idMal: Int) { Media (idMal: $idMal, type: ANIME) { id idMal } }"
-        r2 = requests.post("https://graphql.anilist.co", json={"query": q2, "variables": {"idMal": int_id}}, headers=headers, timeout=5)
-        if r2.status_code == 200:
-            media = r2.json().get("data", {}).get("Media")
-            if media:
-                if media.get("idMal"): ids["mal_id"] = str(media["idMal"])
-                if media.get("id"): ids["anilist_id"] = str(media["id"])
-                return ids
+        if not media:
+            q2 = f"query ($idMal: Int) {{ Media (idMal: $idMal, type: ANIME) {{ {gql_fields} }} }}"
+            r2 = requests.post("https://graphql.anilist.co", json={"query": q2, "variables": {"idMal": int_id}}, headers=headers, timeout=6)
+            if r2.status_code == 200:
+                media = r2.json().get("data", {}).get("Media")
+
+        if media:
+            if media.get("idMal"):
+                ids["mal_id"] = str(media["idMal"])
+            if media.get("id"):
+                ids["anilist_id"] = str(media["id"])
+            ids["season_year"] = media.get("seasonYear")
+            ids["episodes"] = media.get("episodes")
+            t_obj = media.get("title") or {}
+            t_list = [t_obj.get("english"), t_obj.get("romaji"), t_obj.get("userPreferred")]
+            ids["titles"] = [t.strip() for t in t_list if t and str(t).strip()]
+            if ids["titles"]:
+                ids["title"] = ids["titles"][0]
+
+            # Extract TV PREQUEL chain (up to 2 levels for Part 2 / Part 3 split cours)
+            edges = (media.get("relations") or {}).get("edges") or []
+            for edge in edges:
+                if edge.get("relationType") == "PREQUEL":
+                    pnode = edge.get("node") or {}
+                    if pnode.get("type") == "ANIME" and pnode.get("format") == "TV" and (pnode.get("episodes") or 0) > 0:
+                        pt_obj = pnode.get("title") or {}
+                        pt_list = [pt_obj.get("english"), pt_obj.get("romaji"), pt_obj.get("userPreferred")]
+                        p_titles = [t.strip() for t in pt_list if t and str(t).strip()]
+                        p_eps = int(pnode["episodes"])
+                        ids["prequels"].append({
+                            "anilist_id": str(pnode["id"]) if pnode.get("id") else None,
+                            "mal_id": str(pnode["idMal"]) if pnode.get("idMal") else None,
+                            "episodes_offset": p_eps,
+                            "season_year": pnode.get("seasonYear"),
+                            "title": p_titles[0] if p_titles else None,
+                            "titles": p_titles
+                        })
+                        # Check 2nd-level prequel (e.g. Part 3 -> Part 2 -> Part 1)
+                        sub_edges = (pnode.get("relations") or {}).get("edges") or []
+                        for sedge in sub_edges:
+                            if sedge.get("relationType") == "PREQUEL":
+                                spnode = sedge.get("node") or {}
+                                if spnode.get("type") == "ANIME" and spnode.get("format") == "TV" and (spnode.get("episodes") or 0) > 0:
+                                    spt_obj = spnode.get("title") or {}
+                                    spt_list = [spt_obj.get("english"), spt_obj.get("romaji"), spt_obj.get("userPreferred")]
+                                    sp_titles = [t.strip() for t in spt_list if t and str(t).strip()]
+                                    sp_eps = int(spnode["episodes"])
+                                    ids["prequels"].append({
+                                        "anilist_id": str(spnode["id"]) if spnode.get("id") else None,
+                                        "mal_id": str(spnode["idMal"]) if spnode.get("idMal") else None,
+                                        "episodes_offset": p_eps + sp_eps,
+                                        "season_year": spnode.get("seasonYear"),
+                                        "title": sp_titles[0] if sp_titles else None,
+                                        "titles": sp_titles
+                                    })
     except Exception:
         pass
     return ids
 
-def resolve_megaplay_via_anikoto(title, ep_num):
+def _parse_anikoto_search_items(html):
+    """Parses <a class='item' ...> blocks from Anikoto search HTML into structured candidate dicts."""
+    items = []
+    if not html:
+        return items
+    for m in re.finditer(r'<a\b[^>]*class=[\'"][^\'"]*\bitem\b[^\'"]*[\'"][^>]*>([\s\S]*?)</a>', html, re.IGNORECASE):
+        full_tag = m.group(0)
+        inner = m.group(1)
+        m_href = re.search(r'href=[\'"](https?://anikoto\.cz/watch/[^/\'"]+|/watch/[^/\'"]+)[\'"]', full_tag, re.IGNORECASE)
+        if not m_href:
+            continue
+        href = m_href.group(1)
+        if not href.startswith("http"):
+            href = "https://anikoto.cz" + href
+        m_name = re.search(r'<div[^>]*class=[\'"][^\'"]*\bname\b[^\'"]*[\'"][^>]*>([^<]*)</div>', inner, re.IGNORECASE)
+        en_title = m_name.group(1).strip() if m_name else ""
+        m_jp = re.search(r'data-jp=[\'"]([^\'"]*)[\'"]', inner, re.IGNORECASE)
+        jp_title = m_jp.group(1).strip() if m_jp else ""
+        m_yr = re.search(r'<span[^>]*class=[\'"][^\'"]*\bdot\b[^\'"]*[\'"][^>]*>\s*(19\d\d|20\d\d)\s*</span>', inner, re.IGNORECASE)
+        year = int(m_yr.group(1)) if m_yr else None
+        items.append({
+            "href": href,
+            "en_title": en_title,
+            "jp_title": jp_title,
+            "year": year
+        })
+    return items
+
+def resolve_megaplay_via_anikoto(title, ep_num, anime_id=None, id_map=None):
     """
     Directly resolves episode stream using Anikoto Search and https://anikotoapi.site/series/{series_id}.
-    Works 100% reliably for any anime where AniList/MAL endpoints have dead/stale stream IDs or missing episodes.
+    Strictly validates title, season, part, and MAL/AniList IDs so wrong seasons (e.g. S4 instead of S3 Part 2) are never picked,
+    and automatically resolves split-cour Part 2 episodes combined under Prequel series entries.
     """
-    if not title:
+    if not id_map and anime_id:
+        id_map = get_fallback_anime_ids(anime_id)
+    id_map = id_map or {}
+
+    target_titles = list(id_map.get("titles") or [])
+    if title and str(title).strip() and str(title).strip() not in target_titles:
+        target_titles.insert(0, str(title).strip())
+    if not target_titles:
         return None
+
     try:
         s = requests.Session()
         ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
         s.headers.update({"User-Agent": ua})
 
-        # 1. Search Anikoto using fast AJAX search
-        search_url = f"https://anikoto.cz/ajax/anime/search?keyword={requests.utils.quote(str(title))}"
-        r = s.get(search_url, headers={"X-Requested-With": "XMLHttpRequest"}, timeout=10)
-        watch_link = None
-        if r.status_code == 200:
-            html = r.json().get("result", {}).get("html", "")
-            m = re.findall(r'href=[\'"](https?://anikoto\.cz/watch/[^/\'"]+|/watch/[^/\'"]+)', html)
-            if m:
-                watch_link = m[0]
-                if not watch_link.startswith("http"):
-                    watch_link = "https://anikoto.cz" + watch_link
+        def search_anikoto_candidates(kw):
+            cands = []
+            seen_hrefs = set()
+            search_url = f"https://anikoto.cz/ajax/anime/search?keyword={requests.utils.quote(str(kw))}"
+            r = s.get(search_url, headers={"X-Requested-With": "XMLHttpRequest"}, timeout=10)
+            if r.status_code == 200:
+                html = r.json().get("result", {}).get("html", "")
+                for item in _parse_anikoto_search_items(html):
+                    if item["href"] not in seen_hrefs:
+                        seen_hrefs.add(item["href"])
+                        cands.append(item)
+            if not cands:
+                s_url = f"https://anikoto.cz/search?keyword={requests.utils.quote(str(kw))}"
+                s_resp = s.get(s_url, timeout=10)
+                if s_resp.status_code == 200:
+                    for item in _parse_anikoto_search_items(s_resp.text):
+                        if item["href"] not in seen_hrefs:
+                            seen_hrefs.add(item["href"])
+                            cands.append(item)
+            return cands
 
-        # Fallback to standard web search if AJAX search had no results
-        if not watch_link:
-            s_url = f"https://anikoto.cz/search?keyword={requests.utils.quote(str(title))}"
-            s_resp = s.get(s_url, timeout=10)
-            if s_resp.status_code == 200:
-                m_watch = re.search(r'href=[\'"](https?://anikoto\.cz/watch/[^/\'"]+|/watch/[^/\'"]+)[\'"]', s_resp.text)
-                if m_watch:
-                    watch_link = m_watch.group(1)
-                    if not watch_link.startswith("http"):
-                        watch_link = "https://anikoto.cz" + watch_link
+        def try_resolve_from_watch_link(watch_link, target_ep_num, expected_ani_id=None, expected_mal_id=None):
+            wr = s.get(watch_link, timeout=10)
+            dids = re.findall(r'data-id=[\'"](\d+)[\'"]', wr.text)
+            if not dids:
+                return None
+            series_id = dids[0]
 
-        if not watch_link:
-            return None
+            api_url = f"https://anikotoapi.site/series/{series_id}"
+            api_res = s.get(api_url, timeout=10)
+            if api_res.status_code == 200:
+                api_json = api_res.json().get("data", {})
+                anime_meta = api_json.get("anime") or {}
+                series_mal = str(anime_meta.get("mal_id") or "").strip()
+                series_ani = str(anime_meta.get("ani_id") or "").strip()
 
-        # 2. Get Series ID from the watch page
-        wr = s.get(watch_link, timeout=10)
-        dids = re.findall(r'data-id=[\'"](\d+)[\'"]', wr.text)
-        if not dids:
-            return None
-        series_id = dids[0]
+                # Strict ID verification: if series has a known MAL or AniList ID and it conflicts with expected IDs, reject it!
+                if expected_mal_id and series_mal and series_mal != str(expected_mal_id):
+                    return None
+                if expected_ani_id and series_ani and series_ani != str(expected_ani_id):
+                    return None
 
-        # 3. Use anikotoapi.site/series/{series_id} for instant and accurate episode embed resolution
-        api_url = f"https://anikotoapi.site/series/{series_id}"
-        api_res = s.get(api_url, timeout=10)
-        if api_res.status_code == 200:
-            episodes = api_res.json().get("data", {}).get("episodes", [])
-            target_ep = next((e for e in episodes if int(e.get("number", 0)) == int(ep_num)), None)
-            if target_ep:
-                embed_id = target_ep.get("episode_embed_id")
-                embed_url = target_ep.get("embed_url", {}).get("sub") or f"https://megaplay.buzz/stream/s-2/{embed_id}/sub"
-                # Fetch MegaPlay embed page to extract data-id
-                mr = s.get(embed_url, headers={"Referer": "https://megaplay.buzz/"}, timeout=10)
-                m_ids = re.findall(r'data-id=[\'"](\d+)[\'"]', mr.text)
-                if m_ids:
-                    print(f"🎬 [AnikotoAPI] Successfully resolved working MegaPlay stream data-id: {m_ids[0]} via Series {series_id} for '{title}' EP {ep_num}", flush=True)
-                    return m_ids[0]
-
-        # 4. Fallback: Parse episode list directly via anikoto AJAX if anikotoapi.site was unreachable
-        ep_list_url = f"https://anikoto.cz/ajax/episode/list/{series_id}"
-        ep_res = s.get(ep_list_url, headers={"X-Requested-With": "XMLHttpRequest", "Referer": watch_link}, timeout=10).json()
-        ep_html = ep_res.get("result", "")
-
-        target_data_ids = None
-        for tag_match in re.finditer(r'<a\b[^>]*>', ep_html, re.IGNORECASE):
-            tag = tag_match.group(0)
-            m_num = re.search(r'\bdata-num=[\'"]?(\d+)[\'"]?', tag, re.IGNORECASE)
-            if m_num and int(m_num.group(1)) == int(ep_num):
-                m_ids = re.search(r'\bdata-ids=[\'"]([^\'"]+)[\'"]', tag, re.IGNORECASE)
-                if m_ids:
-                    target_data_ids = m_ids.group(1)
-                    break
-
-        if target_data_ids:
-            server_list_url = f"https://anikoto.cz/ajax/server/list?servers={requests.utils.quote(target_data_ids)}"
-            srv_res = s.get(server_list_url, headers={"X-Requested-With": "XMLHttpRequest", "Referer": watch_link}, timeout=10).json()
-            srv_html = srv_res.get("result", "")
-            m_links = re.findall(r'data-link-id=[\'"]([^\'"]+)[\'"]', srv_html)
-            if m_links:
-                srv_url = f"https://anikoto.cz/ajax/server?get={requests.utils.quote(m_links[0])}"
-                get_res = s.get(srv_url, headers={"X-Requested-With": "XMLHttpRequest", "Referer": watch_link}, timeout=10).json()
-                stream_url = get_res.get("result", {}).get("url")
-                if stream_url:
-                    mr = s.get(stream_url, headers={"Referer": "https://megaplay.buzz/"}, timeout=10)
+                episodes = api_json.get("episodes", [])
+                target_ep = next((e for e in episodes if int(e.get("number", 0)) == int(target_ep_num)), None)
+                if target_ep:
+                    embed_id = target_ep.get("episode_embed_id")
+                    embed_url = (target_ep.get("embed_url") or {}).get("sub") or f"https://megaplay.buzz/stream/s-2/{embed_id}/sub"
+                    mr = s.get(embed_url, headers={"Referer": "https://megaplay.buzz/"}, timeout=10)
                     m_ids = re.findall(r'data-id=[\'"](\d+)[\'"]', mr.text)
                     if m_ids:
-                        print(f"🎬 [Anikoto Scraper] Successfully resolved MegaPlay stream data-id: {m_ids[0]} for '{title}' EP {ep_num}", flush=True)
+                        print(f"🎬 [AnikotoAPI] Successfully resolved working MegaPlay stream data-id: {m_ids[0]} via Series {series_id} (EP {target_ep_num})", flush=True)
                         return m_ids[0]
+            return None
+
+        # 1. Try strict direct match for current anime at ep_num
+        all_cands = search_anikoto_candidates(target_titles[0])
+        scored = []
+        for c in all_cands:
+            sc = _score_anikoto_candidate(c["en_title"], c["jp_title"], c["year"], target_titles, id_map.get("season_year"))
+            if sc > 0:
+                scored.append((sc, c))
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        for sc, c in scored:
+            did = try_resolve_from_watch_link(
+                c["href"],
+                ep_num,
+                expected_ani_id=id_map.get("anilist_id"),
+                expected_mal_id=id_map.get("mal_id")
+            )
+            if did:
+                return did
+
+        # 2. Try Prequel Continuation match on Anikoto (e.g. Season 3 Part 2 -> Season 3 with ep = prequel_eps + ep_num)
+        for preq in (id_map.get("prequels") or []):
+            preq_titles = preq.get("titles") or ([preq["title"]] if preq.get("title") else [])
+            if not preq_titles:
+                continue
+            combined_ep = int(preq.get("episodes_offset", 0)) + int(ep_num)
+            p_cands = search_anikoto_candidates(preq_titles[0])
+            # Also include any already-fetched candidates
+            seen_h = {pc["href"] for pc in p_cands}
+            for ac in all_cands:
+                if ac["href"] not in seen_h:
+                    p_cands.append(ac)
+
+            p_scored = []
+            for c in p_cands:
+                sc = _score_anikoto_candidate(c["en_title"], c["jp_title"], c["year"], preq_titles, preq.get("season_year"))
+                if sc > 0:
+                    p_scored.append((sc, c))
+            p_scored.sort(key=lambda x: x[0], reverse=True)
+
+            for sc, c in p_scored:
+                did = try_resolve_from_watch_link(
+                    c["href"],
+                    combined_ep,
+                    expected_ani_id=preq.get("anilist_id"),
+                    expected_mal_id=preq.get("mal_id")
+                )
+                if did:
+                    print(f"🎬 [Anikoto Prequel Continuation] Resolved '{target_titles[0]}' EP {ep_num} via Prequel '{preq_titles[0]}' EP {combined_ep} -> data-id {did}", flush=True)
+                    return did
 
     except Exception as e:
         print(f"⚠️ [Anikoto Fallback] Error: {e}", flush=True)
     return None
 
 def fetch_megaplay_english_sub(anime_id, ep_num, title=None):
-    """Fetches English .vtt subtitle URL directly from MegaPlay using AniList ID, MAL ID, and Anikoto fallbacks"""
+    """Fetches English .vtt subtitle URL directly from MegaPlay using AniList ID, MAL ID, Prequel Continuation, and Anikoto fallbacks"""
     candidate_urls = []
     seen = set()
 
@@ -359,11 +589,14 @@ def fetch_megaplay_english_sub(anime_id, ep_num, title=None):
     add_cand(f"https://megaplay.buzz/stream/ani/{anime_id}/{ep_num}/sub")
     add_cand(f"https://megaplay.buzz/stream/mal/{anime_id}/{ep_num}/sub")
 
-    # 2. Resolved MAL & AniList IDs
+    # 2. Resolved MAL & AniList IDs + Prequel metadata
+    id_map = {}
     try:
         id_map = get_fallback_anime_ids(anime_id)
         mal_id = id_map.get("mal_id")
         ani_id = id_map.get("anilist_id")
+        if not title and id_map.get("title"):
+            title = id_map.get("title")
         if mal_id and str(mal_id) != str(anime_id):
             add_cand(f"https://megaplay.buzz/stream/mal/{mal_id}/{ep_num}/sub")
             add_cand(f"https://megaplay.buzz/stream/ani/{mal_id}/{ep_num}/sub")
@@ -373,9 +606,23 @@ def fetch_megaplay_english_sub(anime_id, ep_num, title=None):
     except Exception:
         pass
 
-    # 3. Dub endpoints as secondary fallbacks
+    # 3. Dub endpoints as secondary fallbacks for direct IDs
     add_cand(f"https://megaplay.buzz/stream/ani/{anime_id}/{ep_num}/dub")
     add_cand(f"https://megaplay.buzz/stream/mal/{anime_id}/{ep_num}/dub")
+
+    # 4. Split-Cour / Part 2 Prequel Continuation endpoints on MegaPlay (e.g. AOT S3 Part 2 Ep 1..10 = AOT S3 Ep 13..22)
+    for preq in (id_map.get("prequels") or []):
+        comb_ep = int(preq.get("episodes_offset", 0)) + int(ep_num)
+        p_ani = preq.get("anilist_id")
+        p_mal = preq.get("mal_id")
+        if p_mal:
+            add_cand(f"https://megaplay.buzz/stream/mal/{p_mal}/{comb_ep}/sub")
+        if p_ani:
+            add_cand(f"https://megaplay.buzz/stream/ani/{p_ani}/{comb_ep}/sub")
+        if p_mal:
+            add_cand(f"https://megaplay.buzz/stream/mal/{p_mal}/{comb_ep}/dub")
+        if p_ani:
+            add_cand(f"https://megaplay.buzz/stream/ani/{p_ani}/{comb_ep}/dub")
 
     headers = {
         "Referer": "https://megaplay.buzz/",
@@ -409,7 +656,7 @@ def fetch_megaplay_english_sub(anime_id, ep_num, title=None):
     sources_data = None
     data_id = None
 
-    # Step 1: Try candidate URLs (AniList & MAL)
+    # Step 1: Try candidate URLs (Direct AniList & MAL, then Prequel Continuation AniList & MAL)
     for embed_url in candidate_urls:
         try:
             resp = requests.get(embed_url, headers=headers, timeout=10)
@@ -422,16 +669,17 @@ def fetch_megaplay_english_sub(anime_id, ep_num, title=None):
                     if verified_data:
                         data_id = candidate_did
                         sources_data = verified_data
+                        print(f"✅ Resolved MegaPlay data-id {data_id} via {embed_url}", flush=True)
                         break
                     else:
                         print(f"⚠️ Embed {embed_url} returned data-id {candidate_did}, but getSources failed/404. Falling back...", flush=True)
         except Exception:
             continue
 
-    # Step 2: Anikoto Fallback if AniList/MAL failed or their getSources returned 404/broken
-    if not sources_data and title:
-        print(f"🔄 Triggering Anikoto Fallback for '{title}' EP {ep_num}...", flush=True)
-        anikoto_did = resolve_megaplay_via_anikoto(title, ep_num)
+    # Step 2: Verified Anikoto Fallback if AniList/MAL failed or their getSources returned 404/broken
+    if not sources_data and (title or id_map.get("titles")):
+        print(f"🔄 Triggering Verified Anikoto Fallback for '{title or anime_id}' EP {ep_num}...", flush=True)
+        anikoto_did = resolve_megaplay_via_anikoto(title, ep_num, anime_id=anime_id, id_map=id_map)
         if anikoto_did:
             verified_data = verify_get_sources(anikoto_did)
             if verified_data:
