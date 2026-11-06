@@ -707,47 +707,7 @@ def sanitize_filename_slug(name):
         return ""
     # Replace non-alphanumeric with hyphen
     slug = re.sub(r'[^a-zA-Z0-9]+', '-', str(name).strip()).strip('-').lower()
-    # Truncate THEN strip again, otherwise a cut can leave a trailing '-' (invalid/ugly tag)
-    return slug[:50].strip('-')
-
-def get_default_branch(github_repo, headers):
-    """Returns the repo's real default branch (main/master/etc). Falls back to None."""
-    try:
-        r = requests.get(f"https://api.github.com/repos/{github_repo}", headers=headers, timeout=10)
-        if r.status_code == 200:
-            return r.json().get("default_branch") or None
-    except Exception:
-        pass
-    return None
-
-def repo_has_commits(github_repo, headers):
-    """True if the repo has at least one commit (GitHub cannot create tags on an empty repo)."""
-    try:
-        r = requests.get(f"https://api.github.com/repos/{github_repo}/commits?per_page=1", headers=headers, timeout=10)
-        return r.status_code == 200
-    except Exception:
-        return False
-
-def ensure_repo_initialized(github_repo, headers):
-    """Makes sure the repo has a commit + a valid default branch. Returns the branch name."""
-    branch = get_default_branch(github_repo, headers)
-    if repo_has_commits(github_repo, headers):
-        return branch
-
-    print(f"🌱 Repo '{github_repo}' has no commits. Creating initial README commit...", flush=True)
-    payload = {
-        "message": "Initial commit - AniShift Sub Vault",
-        "content": "IyBBbmlTaGlmdCBTdWJ0aXRsZSBWYXVsdA==",  # "# AniShift Subtitle Vault"
-    }
-    # Don't force a branch name: let GitHub use the repo default
-    if branch:
-        payload["branch"] = branch
-    pr = requests.put(f"https://api.github.com/repos/{github_repo}/contents/README.md",
-                      headers=headers, json=payload, timeout=15)
-    if pr.status_code not in (200, 201):
-        print(f"⚠️ README init failed: {pr.status_code} {pr.text[:300]}", flush=True)
-    time.sleep(2)
-    return get_default_branch(github_repo, headers) or branch
+    return slug[:50]
 
 def ensure_github_repository(github_repo, github_token):
     """Ensures GitHub repository exists. If not, automatically creates it under user account."""
@@ -793,7 +753,7 @@ def ensure_github_repository(github_repo, github_token):
 
     return github_repo
 
-def upload_sub_to_github_release(vtt_text, anime_id, ep_num, github_token, github_repo, anime_title="", category="tv"):
+def upload_sub_to_github_release(vtt_text, anime_id, ep_num, github_token, github_repo, anime_title="", category="tv", existing_sub_url=None):
     """
     Uploads Sinhala WebVTT as direct asset to a GitHub Release.
     Naming conventions:
@@ -802,6 +762,19 @@ def upload_sub_to_github_release(vtt_text, anime_id, ep_num, github_token, githu
     - Release Tag: sub-{anime_slug} (or sub-{anime_slug}-p2 for 500+ batches)
     - Auto-Vault Fallback: Automatically rolls over to next vault repo if limit is reached.
     """
+    explicit_tag = None
+    explicit_asset_name = None
+    if existing_sub_url and "github.com/" in str(existing_sub_url) and "/releases/download/" in str(existing_sub_url):
+        try:
+            clean_existing = str(existing_sub_url).split("?")[0].strip()
+            m_gh = re.search(r'github\.com/([^/]+/[^/]+)/releases/download/([^/]+)/([^/?#]+)', clean_existing)
+            if m_gh:
+                github_repo = m_gh.group(1)
+                explicit_tag = m_gh.group(2)
+                explicit_asset_name = m_gh.group(3)
+        except Exception:
+            pass
+
     # Ensure target repo exists, auto-create if missing
     github_repo = ensure_github_repository(github_repo, github_token)
 
@@ -811,20 +784,14 @@ def upload_sub_to_github_release(vtt_text, anime_id, ep_num, github_token, githu
         "User-Agent": "MegaPlaySubBot/1.0"
     }
 
-    # Detect real default branch (hardcoded "main" caused "tag_name is not a valid tag" on master/empty repos)
-    default_branch = ensure_repo_initialized(github_repo, headers)
-
     anime_slug = sanitize_filename_slug(anime_title) or f"ani-{anime_id}"
     ep_int = int(ep_num)
-    is_movie = (category == "movie" or ep_int == 1 and "movie" in anime_slug)
+    is_movie = (category == "movie" or (ep_int == 1 and "movie" in anime_slug))
 
     # Chunk batches by 500 episodes to respect GitHub's 1000 asset per release limit
     chunk_idx = ((ep_int - 1) // 500) + 1 if not is_movie else 1
     part_suffix = f"-p{chunk_idx}" if chunk_idx > 1 else ""
-    tag_name = f"sub-{anime_slug}{part_suffix}"
-    # Final safety net: tag must only contain safe chars and not end with '-' / '.'
-    tag_name = re.sub(r'[^A-Za-z0-9._-]+', '-', tag_name).strip('-.') or f"sub-ani-{anime_id}"
-    print(f"🏷️ Release tag: {tag_name!r} | branch: {default_branch!r}", flush=True)
+    tag_name = explicit_tag or f"sub-{anime_slug}{part_suffix}"
 
     rel_url = f"https://api.github.com/repos/{github_repo}/releases/tags/{tag_name}"
     resp = requests.get(rel_url, headers=headers, timeout=15)
@@ -845,13 +812,12 @@ def upload_sub_to_github_release(vtt_text, anime_id, ep_num, github_token, githu
 
         release_payload = {
             "tag_name": tag_name,
+            "target_commitish": "main",
             "name": release_display_name,
             "body": f"Automated WebVTT Sinhala subtitles for {anime_title or anime_id} (Batch {chunk_idx})",
             "draft": False,
             "prerelease": False
         }
-        if default_branch:
-            release_payload["target_commitish"] = default_branch
 
         c_resp = requests.post(create_url, headers=headers, json=release_payload, timeout=15)
 
@@ -876,17 +842,15 @@ def upload_sub_to_github_release(vtt_text, anime_id, ep_num, github_token, githu
                                 c_resp._content = json.dumps(r_item).encode('utf-8')
                                 break
             else:
-                print(f"🌱 GitHub Release validation failed on '{github_repo}': {resp_txt[:300]}", flush=True)
-                # Re-check branch/commits, then retry once WITHOUT target_commitish (GitHub uses default branch)
-                default_branch = ensure_repo_initialized(github_repo, headers)
+                print(f"🌱 GitHub Release validation failed on '{github_repo}'. Checking/committing README.md...", flush=True)
+                readme_payload = {
+                    "message": "Initial commit - AniShift Sub Vault",
+                    "content": "IyBBbmlTaGlmdCBTdWJ0aXRsZSBWYXVsdA==", # Base64 for "# AniShift Subtitle Vault"
+                    "branch": "main"
+                }
+                requests.put(f"https://api.github.com/repos/{github_repo}/contents/README.md", headers=headers, json=readme_payload, timeout=15)
                 time.sleep(2)
-                release_payload.pop("target_commitish", None)
-                if default_branch:
-                    release_payload["target_commitish"] = default_branch
                 c_resp = requests.post(create_url, headers=headers, json=release_payload, timeout=15)
-                if c_resp.status_code == 422 and "already_exists" not in c_resp.text:
-                    release_payload.pop("target_commitish", None)
-                    c_resp = requests.post(create_url, headers=headers, json=release_payload, timeout=15)
 
         if c_resp.status_code in (200, 201):
             rel_data = c_resp.json()
@@ -898,37 +862,43 @@ def upload_sub_to_github_release(vtt_text, anime_id, ep_num, github_token, githu
     # Asset naming:
     # Series: {anime_slug}_ep_{ep_num}_sinhala.vtt
     # Movie: {anime_slug}_sinhala.vtt (no ep number)
-    if is_movie:
+    if explicit_asset_name:
+        asset_name = explicit_asset_name
+    elif is_movie:
         asset_name = f"{anime_slug}_sinhala.vtt"
     else:
         asset_name = f"{anime_slug}_ep_{ep_num}_sinhala.vtt"
 
     base_upload_url = upload_url_template.split("{")[0]
 
-    # Delete existing asset if present to allow clean replacement (with pagination support)
-    page = 1
-    found_asset = None
-    while page <= 10:
-        assets_url = f"https://api.github.com/repos/{github_repo}/releases/{release_id}/assets?per_page=100&page={page}"
-        a_resp = requests.get(assets_url, headers=headers, timeout=15)
-        if a_resp.status_code == 200:
-            assets_chunk = a_resp.json()
-            if not assets_chunk:
-                break
-            for asset in assets_chunk:
-                if asset.get("name") == asset_name:
-                    found_asset = asset
+    def delete_matching_asset():
+        page = 1
+        found = None
+        while page <= 10:
+            assets_url = f"https://api.github.com/repos/{github_repo}/releases/{release_id}/assets?per_page=100&page={page}"
+            a_resp = requests.get(assets_url, headers=headers, timeout=15)
+            if a_resp.status_code == 200:
+                assets_chunk = a_resp.json()
+                if not assets_chunk:
                     break
-            if found_asset or len(assets_chunk) < 100:
+                for asset in assets_chunk:
+                    if asset.get("name") == asset_name:
+                        found = asset
+                        break
+                if found or len(assets_chunk) < 100:
+                    break
+                page += 1
+            else:
                 break
-            page += 1
-        else:
-            break
+        if found:
+            del_url = f"https://api.github.com/repos/{github_repo}/releases/assets/{found['id']}"
+            requests.delete(del_url, headers=headers, timeout=15)
+            time.sleep(1.2)
+            return True
+        return False
 
-    if found_asset:
-        del_url = f"https://api.github.com/repos/{github_repo}/releases/assets/{found_asset['id']}"
-        requests.delete(del_url, headers=headers, timeout=15)
-        time.sleep(1) # Allow GitHub to finalize asset deletion
+    # Delete existing asset if present to allow clean replacement
+    was_replaced = delete_matching_asset()
 
     upload_headers = {
         "Authorization": f"Bearer {github_token}",
@@ -943,12 +913,25 @@ def upload_sub_to_github_release(vtt_text, anime_id, ep_num, github_token, githu
         timeout=30
     )
 
+    if up_resp.status_code == 422 and "already_exists" in up_resp.text:
+        delete_matching_asset()
+        time.sleep(1.5)
+        up_resp = requests.post(
+            f"{base_upload_url}?name={asset_name}",
+            headers=upload_headers,
+            data=vtt_text.encode("utf-8"),
+            timeout=30
+        )
+
     if up_resp.status_code in (200, 201):
         asset_data = up_resp.json()
-        return asset_data.get("browser_download_url")
+        dl_url = asset_data.get("browser_download_url")
+        if was_replaced or existing_sub_url:
+            return f"{dl_url}?v={int(time.time())}"
+        return dl_url
     elif up_resp.status_code == 422 and "already_exists" in up_resp.text:
-        # Fallback: Asset already exists on release, construct and return the public CDN URL
         print(f"ℹ️ Asset '{asset_name}' already registered in release {tag_name}, using CDN URL.", flush=True)
-        return f"https://github.com/{github_repo}/releases/download/{tag_name}/{asset_name}"
+        return f"https://github.com/{github_repo}/releases/download/{tag_name}/{asset_name}?v={int(time.time())}"
     else:
         raise RuntimeError(f"Failed uploading asset: {up_resp.status_code} {up_resp.text}")
+
