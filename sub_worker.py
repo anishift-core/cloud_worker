@@ -25,6 +25,7 @@ from sub_engine import (
     upload_sub_to_github_release,
     adjust_vtt_timing,
     convert_srt_to_vtt,
+    convert_ass_to_vtt,
     extract_episode_number_from_filename,
     has_sinhala_characters
 )
@@ -139,22 +140,39 @@ def main():
                 if is_zip:
                     print(f"📦 Custom URL is a ZIP archive! Extracting subtitle for Episode {ep_num}...", flush=True)
                     with zipfile.ZipFile(zip_buf, "r") as zf:
-                        found_vtt = None
-                        matched_fname = None
+                        matching_fnames = []
                         for fname in zf.namelist():
                             if fname.endswith("/") or "__MACOSX" in fname:
                                 continue
                             fl = fname.lower()
-                            if fl.endswith(".vtt") or fl.endswith(".srt") or fl.endswith(".ass") or fl.endswith(".sub"):
+                            if fl.endswith(".vtt") or fl.endswith(".srt") or fl.endswith(".ass") or fl.endswith(".ssa") or fl.endswith(".sub"):
                                 extracted_ep = extract_episode_number_from_filename(fname)
                                 if extracted_ep == ep_num:
-                                    raw_txt = zf.read(fname).decode("utf-8-sig", errors="replace")
-                                    found_vtt = convert_srt_to_vtt(raw_txt)
-                                    matched_fname = fname
-                                    print(f"✅ Found exact match in ZIP for Ep {ep_num}: {fname} ({len(found_vtt)} bytes)", flush=True)
-                                    break
+                                    matching_fnames.append(fname)
 
-                        if found_vtt:
+                        # Prefer English or specific language tracks if multiple exist (e.g. track6_[eng].ass vs track5_und.ass)
+                        def score_zip_file(name):
+                            nl = name.lower()
+                            score = 0
+                            if any(k in nl for k in ["eng", "english", "[en]", "_en.", "en-"]):
+                                score += 100
+                            if "und" not in nl:
+                                score += 20
+                            if nl.endswith(".ass") or nl.endswith(".ssa"):
+                                score += 10
+                            return score
+
+                        matching_fnames.sort(key=score_zip_file, reverse=True)
+
+                        if matching_fnames:
+                            matched_fname = matching_fnames[0]
+                            raw_txt = zf.read(matched_fname).decode("utf-8-sig", errors="replace")
+                            mfl = matched_fname.lower()
+                            if mfl.endswith(".ass") or mfl.endswith(".ssa") or "[events]" in raw_txt.lower():
+                                found_vtt = convert_ass_to_vtt(raw_txt)
+                            else:
+                                found_vtt = convert_srt_to_vtt(raw_txt)
+                            print(f"✅ Found best match in ZIP for Ep {ep_num}: {matched_fname} ({len(found_vtt)} bytes)", flush=True)
                             raw_sub_text = found_vtt
                         else:
                             print(f"⚠️ Episode {ep_num} not found inside ZIP archive!", flush=True)
@@ -165,7 +183,11 @@ def main():
                     if "<!DOCTYPE" in decoded or "<html" in decoded.lower():
                         print(f"⚠️ Downloaded custom sub URL returned an HTML webpage instead of subtitle text!", flush=True)
                     else:
-                        raw_sub_text = convert_srt_to_vtt(decoded)
+                        c_lower = custom_sub_url.lower()
+                        if c_lower.endswith(".ass") or c_lower.endswith(".ssa") or "[events]" in decoded.lower():
+                            raw_sub_text = convert_ass_to_vtt(decoded)
+                        else:
+                            raw_sub_text = convert_srt_to_vtt(decoded)
                         print(f"✅ Successfully downloaded custom subtitle ({len(raw_sub_text)} bytes)", flush=True)
             else:
                 print(f"❌ Failed to download custom sub: HTTP {resp.status_code}", flush=True)
