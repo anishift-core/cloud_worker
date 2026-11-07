@@ -1087,7 +1087,7 @@ def sanitize_filename_slug(name):
         return ""
     # Replace non-alphanumeric with hyphen
     slug = re.sub(r'[^a-zA-Z0-9]+', '-', str(name).strip()).strip('-').lower()
-    return slug[:50]
+    return slug[:50].strip('-')
 
 def ensure_github_repository(github_repo, github_token):
     """Ensures GitHub repository exists. If not, automatically creates it under user account."""
@@ -1171,7 +1171,8 @@ def upload_sub_to_github_release(vtt_text, anime_id, ep_num, github_token, githu
     # Chunk batches by 500 episodes to respect GitHub's 1000 asset per release limit
     chunk_idx = ((ep_int - 1) // 500) + 1 if not is_movie else 1
     part_suffix = f"-p{chunk_idx}" if chunk_idx > 1 else ""
-    tag_name = explicit_tag or f"sub-{anime_slug}{part_suffix}"
+    raw_tag = explicit_tag or f"sub-{anime_slug}{part_suffix}"
+    tag_name = re.sub(r'[^a-zA-Z0-9._-]+', '-', str(raw_tag)).strip('-.') or f"sub-ani-{anime_id}"
 
     rel_url = f"https://api.github.com/repos/{github_repo}/releases/tags/{tag_name}"
     resp = requests.get(rel_url, headers=headers, timeout=15)
