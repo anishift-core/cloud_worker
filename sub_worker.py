@@ -89,6 +89,8 @@ def main():
     anime_id = str(payload.get("anime_id"))
     ep_num = int(payload.get("ep_num", 1))
     episode_path = payload.get("episode_path")
+    category = payload.get("category", "tv")
+    is_movie = (category == "movie") or ("anime_movies" in str(episode_path or ""))
     anime_title = payload.get("title") or payload.get("anime_title") or payload.get("name") or None
 
     print(f"🎬 [CloudSubWorker] Starting Job {job_id}: Anime {anime_id} EP {ep_num} ({episode_path})", flush=True)
@@ -138,27 +140,41 @@ def main():
                     is_zip = False
 
                 if is_zip:
-                    print(f"📦 Custom URL is a ZIP archive! Extracting subtitle for Episode {ep_num}...", flush=True)
+                    print(f"📦 Custom URL is a ZIP archive! Extracting subtitle for Episode {ep_num} (is_movie={is_movie})...", flush=True)
                     with zipfile.ZipFile(zip_buf, "r") as zf:
+                        all_sub_fnames = []
                         matching_fnames = []
                         for fname in zf.namelist():
                             if fname.endswith("/") or "__MACOSX" in fname:
                                 continue
                             fl = fname.lower()
                             if fl.endswith(".vtt") or fl.endswith(".srt") or fl.endswith(".ass") or fl.endswith(".ssa") or fl.endswith(".sub"):
+                                all_sub_fnames.append(fname)
                                 extracted_ep = extract_episode_number_from_filename(fname)
-                                if extracted_ep == ep_num:
+                                if is_movie or extracted_ep == ep_num:
                                     matching_fnames.append(fname)
+
+                        # Fallback for Movies or Single-Sub ZIPs: if no filename matched ep_num (e.g. "Your.Name.2016.1080p.srt" has no episode number
+                        # or parsed a release group number like "264"), pick from all subtitle files in the ZIP!
+                        if not matching_fnames and (is_movie or len(all_sub_fnames) == 1):
+                            print(f"🎬 Movie / Single-file ZIP fallback: selecting from {len(all_sub_fnames)} subtitle file(s) in ZIP: {all_sub_fnames}", flush=True)
+                            matching_fnames = all_sub_fnames
 
                         # Prefer English or specific language tracks if multiple exist (e.g. track6_[eng].ass vs track5_und.ass)
                         def score_zip_file(name):
                             nl = name.lower()
                             score = 0
+                            if any(k in nl for k in ["sinhala", "sin", ".si.", "_si."]):
+                                score += 150
                             if any(k in nl for k in ["eng", "english", "[en]", "_en.", "en-"]):
                                 score += 100
+                            if "forced" in nl or "sign" in nl:
+                                score -= 80
                             if "und" not in nl:
                                 score += 20
-                            if nl.endswith(".ass") or nl.endswith(".ssa"):
+                            if nl.endswith(".srt") or nl.endswith(".vtt"):
+                                score += 15
+                            elif nl.endswith(".ass") or nl.endswith(".ssa"):
                                 score += 10
                             return score
 
@@ -175,7 +191,7 @@ def main():
                             print(f"✅ Found best match in ZIP for Ep {ep_num}: {matched_fname} ({len(found_vtt)} bytes)", flush=True)
                             raw_sub_text = found_vtt
                         else:
-                            print(f"⚠️ Episode {ep_num} not found inside ZIP archive!", flush=True)
+                            print(f"⚠️ Episode {ep_num} not found inside ZIP archive! Files inside ZIP: {zf.namelist()}", flush=True)
                 else:
                     # Single subtitle file download
                     decoded = content_bytes.decode("utf-8-sig", errors="replace")
@@ -194,8 +210,21 @@ def main():
         except Exception as ce:
             print(f"❌ Custom sub download exception: {ce}", flush=True)
 
+        # IMPORTANT: If user explicitly provided a custom_sub_url and it failed, DO NOT waste time searching MegaPlay!
+        if not raw_sub_text:
+            err_msg = f"Failed to extract/download subtitle from Custom URL: {custom_sub_url}"
+            print(f"❌ {err_msg} (Skipping MegaPlay search for custom upload)", flush=True)
+            rtdb.reference(f"megaplay_sub_jobs/completed/{job_id}").set({
+                "status": "failed",
+                "error": err_msg,
+                "anime_id": anime_id,
+                "ep_num": ep_num,
+                "timestamp": time.time()
+            })
+            sys.exit(0)
+
     if not raw_sub_text:
-        # Fallback to MegaPlay English sub
+        # Fallback to MegaPlay English sub (ONLY for normal non-custom jobs)
         print(f"📥 Fetching English Subtitle from MegaPlay...", flush=True)
         eng_vtt, err = fetch_megaplay_english_sub(anime_id, ep_num, title=anime_title)
         if err or not eng_vtt:
