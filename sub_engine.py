@@ -34,21 +34,37 @@ try:
 except ImportError:
     GoogleTranslator = None
 
-# Spoken Sinhala dictionary
+# Spoken Sinhala dictionary & grammar rules
 try:
-    from spoken_dict import SPOKEN_DICT
+    from spoken_dict import SPOKEN_DICT, SPOKEN_REGEX_RULES
 except ImportError:
-    SPOKEN_DICT = {}
+    try:
+        from spoken_dict import SPOKEN_DICT
+    except ImportError:
+        SPOKEN_DICT = {}
+    SPOKEN_REGEX_RULES = []
+
+_SORTED_SPOKEN_PATTERNS = [
+    (re.compile(r'(?<![\w\u0D80-\u0DFF\u200D])' + re.escape(k) + r'(?![\w\u0D80-\u0DFF\u200D])'), SPOKEN_DICT[k])
+    for k in sorted(SPOKEN_DICT.keys(), key=len, reverse=True)
+] if SPOKEN_DICT else []
+
+_COMPILED_SPOKEN_REGEX = [
+    (re.compile(pat) if isinstance(pat, str) else pat, repl)
+    for pat, repl in (SPOKEN_REGEX_RULES or [])
+]
 
 def apply_spoken_sinhala(text):
-    if not text or not SPOKEN_DICT: return text
-    sorted_keys = sorted(SPOKEN_DICT.keys(), key=len, reverse=True)
+    if not text:
+        return text
     result_text = str(text)
-    for key in sorted_keys:
-        value = SPOKEN_DICT[key]
-        pattern = r'(?<![\w\u0D80-\u0DFF])' + re.escape(key) + r'(?![\w\u0D80-\u0DFF])'
-        result_text = re.sub(pattern, value, result_text)
-    return result_text
+    # 1. Run longest-first phrase and word dictionary replacements first
+    for pat, value in _SORTED_SPOKEN_PATTERNS:
+        result_text = pat.sub(value, result_text)
+    # 2. Run structural regex rules to catch any remaining literary suffixes (-නු ඇත/තියෙනවා, -ිය පුළුවන්, etc.)
+    for pat, repl in _COMPILED_SPOKEN_REGEX:
+        result_text = pat.sub(repl, result_text)
+    return result_text.strip()
 
 def has_sinhala_characters(text):
     return bool(re.search(r'[\u0D80-\u0DFF]', str(text)))
@@ -988,6 +1004,24 @@ ANIME_ENGLISH_GLOSSARY = [
     (re.compile(r'\bInter[\s-]*High\b', re.IGNORECASE), 'Inter-High tournament'),
     (re.compile(r'\bNationals\b', re.IGNORECASE), 'National tournament'),
     (re.compile(r'\bPrelims\b', re.IGNORECASE), 'Preliminary rounds'),
+    (re.compile(r'\bhigh\s+school\s+student(s?)\b', re.IGNORECASE), r'High-School student\1'),
+    (re.compile(r'\bhigh\s+school\b', re.IGNORECASE), 'High-School'),
+    (re.compile(r'\bmiddle\s+school\b', re.IGNORECASE), 'Middle-School'),
+    (re.compile(r'\bhomeroom\b', re.IGNORECASE), 'class period'),
+    (re.compile(r'\bcram\s+school\b', re.IGNORECASE), 'tuition class'),
+    (re.compile(r'\bstudent\s+council\b', re.IGNORECASE), 'Student Council'),
+    (re.compile(r'\bclass\s+rep\b', re.IGNORECASE), 'class monitor'),
+    (re.compile(r'\bI\s+see\s*\.\b', re.IGNORECASE), 'I understand.'),
+    (re.compile(r'^I\s+see[!?.]*$', re.IGNORECASE), 'Oh, I understand.'),
+    (re.compile(r'\bWhat\'?s\s+the\s+matter\s*\?', re.IGNORECASE), 'What is the problem?'),
+    (re.compile(r'\bIt\s+can\'?t\s+be\s+helped\b', re.IGNORECASE), 'Nothing can be done about it'),
+    (re.compile(r'\bcan\'?t\s+be\s+helped\b', re.IGNORECASE), 'cannot be avoided'),
+    (re.compile(r'\bDon\'?t\s+play\s+dumb\b', re.IGNORECASE), 'Do not pretend you do not know'),
+    (re.compile(r'\bGive\s+me\s+a\s+break\b', re.IGNORECASE), 'Stop joking around'),
+    (re.compile(r'\bNo\s+way\s*([!?.])', re.IGNORECASE), r'That is impossible\1'),
+    (re.compile(r'\bAre\s+you\s+kidding\s+me\b', re.IGNORECASE), 'Are you joking with me'),
+    (re.compile(r'\bhang\s+up\b', re.IGNORECASE), 'end the phone call'),
+    (re.compile(r'\bhung\s+up\b', re.IGNORECASE), 'ended the phone call'),
 ]
 
 def _preprocess_anime_english(text):
