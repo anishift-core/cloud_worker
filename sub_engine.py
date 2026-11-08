@@ -105,6 +105,13 @@ def convert_ass_to_vtt(text):
     events_found = False
     format_indices = {}
     cues = []
+    seen_cues = set()
+    
+    # Non-dialogue styles to exclude (Karaoke OP/ED songs, Romaji lyrics, Typesetting/Vector drawings)
+    skip_style_keywords = (
+        'op', 'ed', 'romaji', 'karaoke', 'kfx', 'lyrics', 'song',
+        'insert', 'ending', 'opening', 'credit', 'logo', 'effect'
+    )
     
     for line in lines:
         line_clean = line.strip()
@@ -123,12 +130,22 @@ def convert_ass_to_vtt(text):
             raw_data = line_clean[9:].split(',', len(format_indices) - 1) if format_indices else line_clean[9:].split(',', 9)
             start_idx = format_indices.get('start', 1)
             end_idx = format_indices.get('end', 2)
+            style_idx = format_indices.get('style', 3)
+            effect_idx = format_indices.get('effect', 8)
             text_idx = format_indices.get('text', len(raw_data) - 1)
             
             if len(raw_data) > max(start_idx, end_idx, text_idx):
                 start = raw_data[start_idx].strip()
                 end = raw_data[end_idx].strip()
+                style_val = raw_data[style_idx].strip().lower() if len(raw_data) > style_idx else ""
+                effect_val = raw_data[effect_idx].strip().lower() if len(raw_data) > effect_idx else ""
                 dialogue = raw_data[text_idx]
+                
+                # Skip OP/ED karaoke, Romaji song styles, and ASS vector drawings ({\p1}..{\p0})
+                if any(kw in style_val for kw in skip_style_keywords) or any(kw in effect_val for kw in ('karaoke', 'fx', 'template')):
+                    continue
+                if re.search(r'\{\\[^}]*\\p[1-9]', dialogue):
+                    continue
                 
                 # Strip ASS formatting tags {\an8}, {\b1}, {\c&H...&}, etc.
                 dialogue = re.sub(r'\{[^\}]*\}', '', dialogue)
@@ -150,7 +167,16 @@ def convert_ass_to_vtt(text):
                         return f"{h}:{m}:{s}.{ms}"
                     return t
                 
-                cues.append(f"{fmt_time(start)} --> {fmt_time(end)}\n{dialogue}")
+                t_start = fmt_time(start)
+                t_end = fmt_time(end)
+                if t_start == t_end:
+                    continue
+                
+                cue_key = (t_start, t_end, dialogue)
+                if cue_key in seen_cues:
+                    continue
+                seen_cues.add(cue_key)
+                cues.append(f"{t_start} --> {t_end}\n{dialogue}")
                 
     return "WEBVTT\n\n" + "\n\n".join(cues)
 
@@ -596,8 +622,14 @@ def resolve_megaplay_via_anikoto(title, ep_num, anime_id=None, id_map=None):
                     return did
 
         # 3. Split-Cour / Base-Season Continuation match via ani.zip TVDB mapping & embed_id jump detection
+        # IMPORTANT: Only run Split-Cour fallback when the target explicitly has a Part / Cour suffix
+        # or verified ani.zip episode mappings! Never strip "Season 2" down to "Season 1" and grab a random Episode 12+N!
+        has_explicit_part = any(
+            bool(re.search(r'\b(?:part|cour)\s*\d+\b|\b\d+(?:st|nd|rd|th)\s*(?:part|cour)\b', str(tt), re.IGNORECASE))
+            for tt in target_titles
+        )
         base_titles = []
-        if id_map.get("base_season_title"):
+        if id_map.get("base_season_title") and (has_explicit_part or id_map.get("anizip_episodes")):
             base_titles.append(id_map["base_season_title"])
         for tt in target_titles:
             stripped = re.sub(r'\b(?:part|cour)\s*\d+\b', '', str(tt), flags=re.IGNORECASE)
@@ -624,7 +656,7 @@ def resolve_megaplay_via_anikoto(title, ep_num, anime_id=None, id_map=None):
             base_scored.sort(key=lambda x: x[0], reverse=True)
 
             az_ep_info = (id_map.get("anizip_episodes") or {}).get(str(ep_num)) or {}
-            az_ep_title = str((az_ep_info.get("title") or {}).get("en") or "").strip().lower()
+            az_ep_title = str((az_ep_info.get("title") or "").strip() if isinstance(az_ep_info.get("title"), str) else ((az_ep_info.get("title") or {}).get("en") or "")).strip().lower()
             az_season_ep_num = az_ep_info.get("episodeNumber")
 
             for sc, c in base_scored:
@@ -646,22 +678,9 @@ def resolve_megaplay_via_anikoto(title, ep_num, anime_id=None, id_map=None):
                     matched_ep = next((e for e in episodes if str(e.get("title") or "").strip().lower() == az_ep_title), None)
                 if not matched_ep and az_season_ep_num and int(az_season_ep_num) > int(ep_num):
                     matched_ep = next((e for e in episodes if int(e.get("number", 0)) == int(az_season_ep_num)), None)
-                if not matched_ep and len(episodes) > int(ep_num):
-                    detected_offset = 0
-                    for idx in range(10, len(episodes)):
-                        try:
-                            prev_emb = int(episodes[idx - 1].get("episode_embed_id") or 0)
-                            curr_emb = int(episodes[idx].get("episode_embed_id") or 0)
-                            if prev_emb > 0 and curr_emb - prev_emb > 50:
-                                detected_offset = int(episodes[idx - 1].get("number") or idx)
-                                break
-                        except Exception:
-                            pass
-                    if not detected_offset and len(episodes) >= 12 + int(ep_num):
-                        detected_offset = 12
-                    if detected_offset > 0:
-                        target_comb_num = detected_offset + int(ep_num)
-                        matched_ep = next((e for e in episodes if int(e.get("number", 0)) == target_comb_num), None)
+                if not matched_ep and has_explicit_part and len(episodes) >= 12 + int(ep_num):
+                    target_comb_num = 12 + int(ep_num)
+                    matched_ep = next((e for e in episodes if int(e.get("number", 0)) == target_comb_num), None)
 
                 if matched_ep:
                     embed_id = matched_ep.get("episode_embed_id")
@@ -965,13 +984,32 @@ def parse_vtt_cues(vtt_text):
 
     return cues
 
+ANIME_ENGLISH_GLOSSARY = [
+    (re.compile(r'\bInter[\s-]*High\b', re.IGNORECASE), 'Inter-High tournament'),
+    (re.compile(r'\bNationals\b', re.IGNORECASE), 'National tournament'),
+    (re.compile(r'\bPrelims\b', re.IGNORECASE), 'Preliminary rounds'),
+]
+
+def _preprocess_anime_english(text):
+    res = str(text)
+    for pat, repl in ANIME_ENGLISH_GLOSSARY:
+        res = pat.sub(repl, res)
+    return res
+
+def _is_primarily_ascii_english(text):
+    letters = re.findall(r'[^\W\d_]', str(text), re.UNICODE)
+    if not letters:
+        return True
+    ascii_letters = [ch for ch in letters if 'a' <= ch.lower() <= 'z']
+    return (len(ascii_letters) / len(letters)) >= 0.85
+
 def translate_guaranteed_sinhala(text):
     """
     High-speed universal multi-language translation pipeline:
     1. If text is already in Sinhala -> return with Spoken Sinhala dictionary.
-    2. Any input language (Japanese, Russian, French, Spanish, German, Chinese, Arabic, etc.)
-       is detected and translated to English first (sl='auto', tl='en') for maximum quality.
-    3. English is translated to Sinhala (sl='en', tl='si').
+    2. If text is already English -> translate directly (sl='en', tl='si') with anime glossary normalization.
+    3. Any non-English input language (Japanese, Russian, French, Spanish, German, Chinese, Arabic, etc.)
+       is detected and translated to English first (sl='auto', tl='en') for maximum quality, then to Sinhala.
     4. Spoken Sinhala dictionary is applied for authentic, natural phrasing.
     """
     if not text or not str(text).strip():
@@ -989,25 +1027,27 @@ def translate_guaranteed_sinhala(text):
     url = "https://clients5.google.com/translate_a/t"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
-    # Step 1: Detect source language and convert to clean English (auto -> en)
-    en_text = clean_text
+    en_text = _preprocess_anime_english(clean_text)
     detected_lang = "en"
-    for _ in range(2):
-        try:
-            resp = requests.get(url, params={"client": "dict-chrome-ex", "sl": "auto", "tl": "en", "q": clean_text}, headers=headers, timeout=6)
-            if resp.status_code == 200:
-                data = resp.json()
-                if isinstance(data, list) and len(data) > 0:
-                    first = data[0]
-                    if isinstance(first, list):
-                        en_text = str(first[0])
-                        if len(first) > 1 and first[1]:
-                            detected_lang = str(first[1]).lower()
-                    else:
-                        en_text = str(first)
-                    break
-        except Exception:
-            time.sleep(0.3)
+
+    # Step 1: Only run auto -> en if text contains non-ASCII / non-English characters
+    if not _is_primarily_ascii_english(clean_text):
+        for _ in range(2):
+            try:
+                resp = requests.get(url, params={"client": "dict-chrome-ex", "sl": "auto", "tl": "en", "q": clean_text}, headers=headers, timeout=6)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if isinstance(data, list) and len(data) > 0:
+                        first = data[0]
+                        if isinstance(first, list):
+                            en_text = _preprocess_anime_english(str(first[0]))
+                            if len(first) > 1 and first[1]:
+                                detected_lang = str(first[1]).lower()
+                        else:
+                            en_text = _preprocess_anime_english(str(first))
+                        break
+            except Exception:
+                time.sleep(0.3)
 
     if detected_lang == "si" or has_sinhala_characters(en_text):
         return apply_spoken_sinhala(en_text)
@@ -1036,43 +1076,103 @@ def translate_guaranteed_sinhala(text):
 
     return clean_text
 
+def _translate_contextual_group(texts_list):
+    """
+    Translates a group of consecutive subtitle cues that form a single split sentence
+    together in one request so Google Translate has full sentence context, then splits back!
+    """
+    if not texts_list:
+        return []
+    if len(texts_list) == 1:
+        return [translate_guaranteed_sinhala(texts_list[0])]
+
+    cleaned = [_preprocess_anime_english(re.sub(r'<[^>]+>', '', str(t)).strip()) for t in texts_list]
+    joined_query = "\n".join(cleaned)
+    url = "https://clients5.google.com/translate_a/t"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+
+    for _ in range(3):
+        try:
+            resp = requests.get(url, params={"client": "dict-chrome-ex", "sl": "en", "tl": "si", "q": joined_query}, headers=headers, timeout=8)
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, list) and len(data) > 0:
+                    si_block = str(data[0][0]) if isinstance(data[0], list) else str(data[0])
+                    parts = [p.strip() for p in si_block.split("\n") if p.strip()]
+                    if len(parts) == len(texts_list) and all(has_sinhala_characters(p) for p in parts):
+                        return [apply_spoken_sinhala(p) for p in parts]
+        except Exception:
+            time.sleep(0.3)
+
+    return [translate_guaranteed_sinhala(t) for t in texts_list]
+
 def process_and_translate_vtt(vtt_content, max_threads=20):
-    """Multi-threaded VTT translation pipeline (Fast, Complete, and 100% Guaranteed Sinhala)"""
+    """Context-aware multi-threaded VTT translation pipeline (Fast, Complete, and 100% Guaranteed Sinhala)"""
     cues = parse_vtt_cues(vtt_content)
     if not cues:
         return None
 
-    # Collect unique cue texts to minimize requests and maximize speed
-    unique_texts = list({c["text"] for c in cues if c["text"].strip()})
-    translation_cache = {}
+    # Group consecutive cues that belong to a split sentence (e.g. cue ends with ',' or '...' or lowercase word,
+    # or next cue starts with lowercase/conjunction) up to 3 cues per group for natural sentence context!
+    cue_groups = []
+    current_group = []
+    for idx, c in enumerate(cues):
+        txt = re.sub(r'<[^>]+>', '', c["text"]).strip()
+        if not txt:
+            if current_group:
+                cue_groups.append(current_group)
+                current_group = []
+            continue
 
-    def worker_translate(orig_text):
-        translated = translate_guaranteed_sinhala(orig_text)
-        return orig_text, translated
+        current_group.append(idx)
+        is_continuation = (
+            txt.endswith((",", "...", "—", "-"))
+            or (txt[-1].isalnum())
+        )
+        next_starts_cont = False
+        if idx + 1 < len(cues):
+            nxt_txt = re.sub(r'<[^>]+>', '', cues[idx + 1]["text"]).strip()
+            if nxt_txt and (nxt_txt[0].islower() or nxt_txt.startswith(("...", "and ", "but ", "or ", "so ", "because ", "since "))):
+                next_starts_cont = True
 
-    completed_count = 0
-    total_unique = len(unique_texts)
-    print(f"📊 Total unique subtitle lines to translate: {total_unique} (using {max_threads} parallel threads)", flush=True)
+        if len(current_group) >= 3 or not (is_continuation or next_starts_cont):
+            cue_groups.append(current_group)
+            current_group = []
+
+    if current_group:
+        cue_groups.append(current_group)
+
+    translated_by_idx = {}
+    completed_groups = 0
+    total_groups = len(cue_groups)
+    print(f"📊 Translating {len(cues)} subtitle cues across {total_groups} contextual groups (using {max_threads} parallel threads)", flush=True)
+
+    def worker_group(grp_indices):
+        grp_texts = [cues[i]["text"] for i in grp_indices]
+        trans_list = _translate_contextual_group(grp_texts)
+        return grp_indices, trans_list
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_threads) as executor:
-        future_to_text = {executor.submit(worker_translate, t): t for t in unique_texts}
-        for future in concurrent.futures.as_completed(future_to_text):
+        future_to_grp = {executor.submit(worker_group, g): g for g in cue_groups}
+        for future in concurrent.futures.as_completed(future_to_grp):
+            grp = future_to_grp[future]
             try:
-                orig, trans = future.result()
-                translation_cache[orig] = trans
+                g_idx, trans_list = future.result()
+                for i, tr in zip(g_idx, trans_list):
+                    translated_by_idx[i] = tr
             except Exception:
-                t = future_to_text[future]
-                translation_cache[t] = t
-            completed_count += 1
-            if completed_count % 50 == 0 or completed_count == total_unique:
-                pct = int((completed_count / total_unique) * 100)
-                print(f"   ⏳ Translated {completed_count}/{total_unique} lines ({pct}%)...", flush=True)
+                for i in grp:
+                    translated_by_idx[i] = cues[i]["text"]
+            completed_groups += 1
+            if completed_groups % 40 == 0 or completed_groups == total_groups:
+                pct = int((completed_groups / max(1, total_groups)) * 100)
+                print(f"   ⏳ Translated {completed_groups}/{total_groups} context groups ({pct}%)...", flush=True)
 
     # Reassemble WebVTT with verified Sinhala text
     out_lines = ["WEBVTT", "Kind: captions", "Language: si", ""]
     cue_idx = 1
-    for cue in cues:
-        si_text = translation_cache.get(cue["text"], cue["text"])
+    for i, cue in enumerate(cues):
+        si_text = translated_by_idx.get(i, cue["text"])
         out_lines.append(str(cue_idx))
         out_lines.append(cue["time"])
         out_lines.append(si_text)
