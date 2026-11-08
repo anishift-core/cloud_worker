@@ -244,13 +244,18 @@ def extract_episode_number_from_filename(filename):
     if m:
         return int(m.group(1))
 
-    # 4. Fallback: find all numbers, excluding standard resolutions and years
-    nums = re.findall(r'\b\d+\b', clean)
+    # 4. Fallback: find all numbers, excluding standard resolutions, codecs, audio channels, and years
+    clean_no_tech = re.sub(
+        r'\b(?:1080p?|720p?|480p?|360p?|2160p?|4k|8k|[xh]\.?26[45]|hevc|av1|10bit|8bit|aac2[\s._-]*0|ddp?5[\s._-]*1|[57][\s._-]*1|2[\s._-]*0|blu-?ray|web-?dl|webrip|bdrip|dvdrip|hdr10?)\b',
+        ' ',
+        clean,
+        flags=re.IGNORECASE
+    )
+    nums = re.findall(r'\b\d+\b', clean_no_tech)
     if nums:
-        filtered = [int(n) for n in nums if int(n) not in (1080, 720, 480, 360, 2160) and not (1950 <= int(n) <= 2030 and len(n) == 4)]
+        filtered = [int(n) for n in nums if int(n) not in (1080, 720, 480, 360, 2160, 264, 265) and not (1950 <= int(n) <= 2035 and len(n) == 4)]
         if filtered:
             return filtered[-1]
-        return int(nums[-1])
 
     return None
 
