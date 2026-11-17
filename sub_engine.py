@@ -650,10 +650,17 @@ def resolve_megaplay_via_anikoto(title, ep_num, anime_id=None, id_map=None):
             for tt in target_titles
         )
         base_titles = []
+        detected_special_num = None
         if id_map.get("base_season_title") and (has_explicit_part or id_map.get("anizip_episodes")):
             base_titles.append(id_map["base_season_title"])
         for tt in target_titles:
-            stripped = re.sub(r'\b(?:part|cour)\s*\d+\b', '', str(tt), flags=re.IGNORECASE)
+            sp_match = re.search(r'\b(?:the\s+final\s+chapters\s+)?special\s+(\d+)\b', str(tt), flags=re.IGNORECASE)
+            if sp_match and not detected_special_num:
+                n = int(sp_match.group(1))
+                if n >= 2:
+                    detected_special_num = n
+            stripped = re.sub(r'\b(?:the\s+final\s+chapters\s+)?special\s+\d+\b', '', str(tt), flags=re.IGNORECASE)
+            stripped = re.sub(r'\b(?:part|cour)\s*\d+\b', '', stripped, flags=re.IGNORECASE)
             stripped = re.sub(r'\b\d+(?:st|nd|rd|th)\s*(?:part|cour)\b', '', stripped, flags=re.IGNORECASE)
             stripped = re.sub(r'\s*\(\d{4}\)\s*', ' ', stripped)
             stripped = re.sub(r'[:\-–—\s]+$', '', stripped)
@@ -699,6 +706,8 @@ def resolve_megaplay_via_anikoto(title, ep_num, anime_id=None, id_map=None):
                     matched_ep = next((e for e in episodes if str(e.get("title") or "").strip().lower() == az_ep_title), None)
                 if not matched_ep and az_season_ep_num and int(az_season_ep_num) > int(ep_num):
                     matched_ep = next((e for e in episodes if int(e.get("number", 0)) == int(az_season_ep_num)), None)
+                if not matched_ep and detected_special_num and int(ep_num) == 1 and detected_special_num <= len(episodes) <= 10:
+                    matched_ep = next((e for e in episodes if int(e.get("number", 0)) == detected_special_num), None)
                 if not matched_ep and has_explicit_part and len(episodes) >= 12 + int(ep_num):
                     target_comb_num = 12 + int(ep_num)
                     matched_ep = next((e for e in episodes if int(e.get("number", 0)) == target_comb_num), None)
