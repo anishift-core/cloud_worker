@@ -667,6 +667,10 @@ def resolve_megaplay_via_anikoto(title, ep_num, anime_id=None, id_map=None):
             stripped = re.sub(r'\s+', ' ', stripped).strip()
             if stripped and stripped.lower() != str(tt).strip().lower() and stripped not in base_titles:
                 base_titles.append(stripped)
+            if sp_match and detected_special_num and stripped:
+                for p_cand in (f"{stripped} Part {detected_special_num + 1}", f"{stripped} Part {detected_special_num}"):
+                    if p_cand not in base_titles:
+                        base_titles.append(p_cand)
 
         if base_titles:
             base_cands = list(all_cands)
